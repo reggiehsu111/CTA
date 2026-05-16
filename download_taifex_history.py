@@ -60,16 +60,31 @@ COLUMNS = [
 
 FIRST_YEAR = 1998   # earliest year available on TAIFEX
 
+# Index / global futures visible in the TAIFEX daily market download dropdown.
+# Used as a fallback when the API requires a browser session to respond correctly.
+INDEX_FUTURES = {
+    "BRF", "BTF", "E4F", "F1F", "G2F", "GDF", "GTF", "M1F",
+    "MTX", "RHF", "RTF", "SHF", "SOF", "SPF", "SXF", "TE",
+    "TF",  "TGF", "TJF", "TMF", "TX",  "UDF", "UNF", "XAF",
+    "XBF", "XEF", "XIF", "XJF", "ZEF", "ZFF",
+}
+
 
 # -----------------------------------------------------------------------------
 # TAIFEX API helpers
 # -----------------------------------------------------------------------------
 
-def fetch_contract_list(session: requests.Session) -> list[dict]:
-    """Return all futures contracts from the TAIFEX commodity API."""
+def fetch_contract_list(session: requests.Session) -> list[dict] | None:
+    """
+    Return all futures contracts from the TAIFEX commodity API.
+    Returns None if the API requires a browser session (returns 'error').
+    """
     resp = session.get(API_URL, headers=HEADERS, timeout=30)
     resp.raise_for_status()
-    return resp.json().get("commodityList", [])
+    data = resp.json().get("commodityList", [])
+    if not isinstance(data, list):
+        return None   # API returned {"commodityList": "error"}
+    return data
 
 
 def download_year(session: requests.Session, year: int, retries: int = 3) -> bytes:
@@ -157,21 +172,33 @@ def main() -> None:
         # -- --list -----------------------------------------------------------
         if args.list:
             contracts = fetch_contract_list(session)
-            print(f"{'Code':<12} {'Type':<8} Name")
-            print("-" * 60)
-            for c in sorted(contracts, key=lambda x: (x["flag"], x["commodity_id"])):
-                kind = "index" if c["flag"] == 0 else "stock"
-                print(f"{c['commodity_id']:<12} {kind:<8} {c.get('commodity_name', '')}")
-            print(f"\nTotal: {len(contracts)} contracts")
+            if contracts:
+                print(f"{'Code':<12} {'Type':<8} Name")
+                print("-" * 60)
+                for c in sorted(contracts, key=lambda x: (x["flag"], x["commodity_id"])):
+                    kind = "index" if c["flag"] == 0 else "stock"
+                    print(f"{c['commodity_id']:<12} {kind:<8} {c.get('commodity_name', '')}")
+                print(f"\nTotal: {len(contracts)} contracts")
+            else:
+                print("Index futures (hardcoded from TAIFEX dropdown):")
+                print("-" * 40)
+                for code in sorted(INDEX_FUTURES):
+                    print(f"  {code}")
+                print(f"\nTotal index: {len(INDEX_FUTURES)} contracts")
+                print("Note: full list unavailable — TAIFEX API requires a browser session.")
             return
 
         # -- resolve commodity_ids --------------------------------------------
         if args.all:
             commodity_ids = None                              # keep everything
         elif args.all_index:
-            contracts     = fetch_contract_list(session)
-            commodity_ids = {c["commodity_id"] for c in contracts if c["flag"] == 0}
-            print(f"Fetched {len(commodity_ids)} index contracts from API")
+            contracts = fetch_contract_list(session)
+            if contracts:
+                commodity_ids = {c["commodity_id"] for c in contracts if c["flag"] == 0}
+                print(f"Fetched {len(commodity_ids)} index contracts from API")
+            else:
+                commodity_ids = INDEX_FUTURES
+                print(f"Using hardcoded list of {len(commodity_ids)} index contracts")
         else:
             commodity_ids = set(args.commodity)
 
