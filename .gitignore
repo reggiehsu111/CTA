@@ -1,0 +1,18 @@
+# data — large CSV not tracked
+mtx_history.csv
+
+# generated chart output
+mtx_chart.html
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# env
+.env
