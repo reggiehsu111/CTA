@@ -25,11 +25,19 @@ import math
 
 import matplotlib.gridspec as gridspec
 import matplotlib.pyplot as plt
+import matplotlib as mpl
 import numpy as np
 import pandas as pd
 
 from .asset import BaseAsset
 from . import operators as _ops
+
+# Use a font that covers CJK characters (近月 / 次月 labels).
+# Try common macOS/system fonts in preference order; fall back to DejaVu Sans.
+mpl.rcParams["font.family"] = [
+    "PingFang SC", "Heiti SC", "Arial Unicode MS",
+    "Noto Sans CJK SC", "DejaVu Sans",
+]
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -123,7 +131,7 @@ def _load_asset(asset: str, time_granularity: str, contract: str = "front") -> B
         import csv
         from pathlib import Path
 
-        data_path = Path(__file__).parent.parent / "mtx_history.csv"
+        data_path = Path(__file__).parent.parent / "history_data" / "MTX_history.csv"
         records = []
         with open(data_path, encoding="utf-8-sig", newline="") as f:
             reader = csv.reader(f)
@@ -275,39 +283,39 @@ def simulate(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Plot — layout
+# Plot — layout  (3 cols × 4 rows)
 #
-#   (0,0) Cum PnL (close)          (0,1) Multi-price cum PnL
-#   (0,2) Turnover over time       (0,3) Signal vs buy-and-hold
-#   (1,0) PnL by day-of-week       (1,1) PnL by day-of-month
-#   (1,2) PnL by year (doy)        (1,3) 近月 vs 次月
-#   (2,0) PnL vs transaction cost  (2,1) CASR around expiry
-#   (2,2–3,x) reserved
+#   (0,0) Cum PnL (close)         (0,1) Multi-price cum PnL    (0,2) Turnover
+#   (1,0) Signal vs buy-hold      (1,1) Front vs back          (1,2) By weekday
+#   (2,0) By day of month         (2,1) By year (doy)          (2,2) PnL vs tcost
+#   (3,0) CASR around expiry      (3,1) —                      (3,2) —
 # ─────────────────────────────────────────────────────────────────────────────
+
+_FS  = 13   # subplot title fontsize
+_FSS = 11   # axis label / legend fontsize
+
 
 def _plot(asset_obj, asset_obj_back, signal, exec_sig, pnl, cum_pnl,
           tcost, pnl_net, cum_pnl_net):
-    fig = plt.figure(figsize=(32, 24))
-    gs  = gridspec.GridSpec(4, 4, figure=fig, hspace=0.35, wspace=0.30)
-    axes = [[fig.add_subplot(gs[r, c]) for c in range(4)] for r in range(4)]
+    fig = plt.figure(figsize=(30, 32))
+    gs  = gridspec.GridSpec(4, 3, figure=fig, hspace=0.40, wspace=0.30)
+    axes = [[fig.add_subplot(gs[r, c]) for c in range(3)] for r in range(4)]
 
     _plot_cum_pnl(axes[0][0], pnl, cum_pnl)
     _plot_price_comparison(axes[0][1], asset_obj, exec_sig)
     _plot_turnover(axes[0][2], exec_sig)
-    _plot_signal_vs_asset(axes[0][3], asset_obj, pnl, cum_pnl)
 
-    _plot_by_weekday(axes[1][0], pnl)
-    _plot_by_dom(axes[1][1], pnl)
-    _plot_by_doy(axes[1][2], pnl)
-    _plot_front_vs_back(axes[1][3], asset_obj, asset_obj_back, exec_sig, pnl, cum_pnl)
+    _plot_signal_vs_asset(axes[1][0], asset_obj, pnl, cum_pnl)
+    _plot_front_vs_back(axes[1][1], asset_obj, asset_obj_back, exec_sig, pnl, cum_pnl)
+    _plot_by_weekday(axes[1][2], pnl)
 
-    _plot_cost_summary(axes[2][0], pnl, cum_pnl, pnl_net, cum_pnl_net, tcost)
-    _plot_casr(axes[2][1], pnl, asset_obj.index)
-    for c in range(2, 4):
-        axes[2][c].axis("off")
+    _plot_by_dom(axes[2][0], pnl)
+    _plot_by_doy(axes[2][1], pnl)
+    _plot_cost_summary(axes[2][2], pnl, cum_pnl, pnl_net, cum_pnl_net, tcost)
 
-    for c in range(4):
-        axes[3][c].axis("off")
+    _plot_casr(axes[3][0], pnl, asset_obj.index)
+    axes[3][1].axis("off")
+    axes[3][2].axis("off")
 
     plt.show()
 
@@ -325,7 +333,7 @@ def _plot_cum_pnl(ax, pnl: pd.Series, cum_pnl: pd.Series) -> None:
                     where=(cum_pnl.values >= 0), alpha=0.15, color="#26a69a")
     ax.fill_between(cum_pnl.index, cum_pnl.values, 0,
                     where=(cum_pnl.values <  0), alpha=0.15, color="#ef5350")
-    ax.set_title(f"Cum PnL — close  (Sharpe {sharpe:.2f})", fontsize=10)
+    ax.set_title(f"Cum PnL — close  (Sharpe {sharpe:.2f})", fontsize=_FS)
     ax.set_xlabel("Date")
     ax.set_ylabel("Cumulative return")
     ax.grid(True, alpha=0.3)
@@ -353,10 +361,10 @@ def _plot_price_comparison(ax, asset_obj, exec_sig: pd.Series) -> None:
                 color=colors[name], label=name, alpha=0.85)
 
     ax.axhline(0, color="white", linewidth=0.5, linestyle="--", alpha=0.4)
-    ax.set_title("Cum PnL by execution price", fontsize=10)
+    ax.set_title("Cum PnL by execution price", fontsize=_FS)
     ax.set_xlabel("Date")
     ax.set_ylabel("Cumulative return")
-    ax.legend(fontsize=8, loc="upper left")
+    ax.legend(fontsize=_FSS, loc="upper left")
     ax.grid(True, alpha=0.3)
 
 
@@ -368,10 +376,10 @@ def _plot_turnover(ax, exec_sig: pd.Series) -> None:
 
     ax.plot(to_20.index,  to_20.values,  linewidth=0.8, color="orange",  alpha=0.8, label="20d avg")
     ax.plot(to_252.index, to_252.values, linewidth=1.2, color="#ffcc02", alpha=0.9, label="252d avg")
-    ax.set_title("Turnover  (|Δexec_sig|)", fontsize=10)
+    ax.set_title("Turnover  (|Δexec_sig|)", fontsize=_FS)
     ax.set_xlabel("Date")
     ax.set_ylabel("Turnover")
-    ax.legend(fontsize=8)
+    ax.legend(fontsize=_FSS)
     ax.grid(True, alpha=0.3)
 
 
@@ -391,7 +399,7 @@ def _plot_by_weekday(ax, pnl: pd.Series) -> None:
 
     ax.bar(lbls, vals, color=_bar_colors(vals), alpha=0.8)
     ax.axhline(0, color="white", linewidth=0.5, linestyle="--", alpha=0.4)
-    ax.set_title("Avg PnL by day of week", fontsize=10)
+    ax.set_title("Avg PnL by day of week", fontsize=_FS)
     ax.set_ylabel("Avg daily return")
     ax.grid(True, alpha=0.3, axis="y")
 
@@ -404,7 +412,7 @@ def _plot_by_dom(ax, pnl: pd.Series) -> None:
 
     ax.bar(days, vals, color=_bar_colors(vals), alpha=0.8, width=0.7)
     ax.axhline(0, color="white", linewidth=0.5, linestyle="--", alpha=0.4)
-    ax.set_title("Avg PnL by day of month", fontsize=10)
+    ax.set_title("Avg PnL by day of month", fontsize=_FS)
     ax.set_xlabel("Day of month")
     ax.set_ylabel("Avg daily return")
     ax.grid(True, alpha=0.3, axis="y")
@@ -425,10 +433,10 @@ def _plot_by_doy(ax, pnl: pd.Series) -> None:
                 label=f"{yr}  SR {sr_str}", alpha=0.75)
 
     ax.axhline(0, color="white", linewidth=0.5, linestyle="--", alpha=0.4)
-    ax.set_title("Cum PnL by year (day of year)", fontsize=10)
+    ax.set_title("Cum PnL by year (day of year)", fontsize=_FS)
     ax.set_xlabel("Day of year")
     ax.set_ylabel("Cumulative return")
-    ax.legend(fontsize=6, ncol=2, loc="upper left")
+    ax.legend(fontsize=_FSS, ncol=2, loc="upper left")
     ax.grid(True, alpha=0.3)
 
 
@@ -447,10 +455,10 @@ def _plot_signal_vs_asset(ax, asset_obj, pnl, cum_pnl) -> None:
     ax.plot(cum_raw.index, cum_raw.values, linewidth=1.0, color="#ffb74d",
             label=f"buy & hold  (SR {sharpe_raw:.2f})", alpha=0.8)
     ax.axhline(0, color="white", linewidth=0.5, linestyle="--", alpha=0.4)
-    ax.set_title(f"Signal vs buy-and-hold  (corr {corr:.2f})", fontsize=10)
+    ax.set_title(f"Signal vs buy-and-hold  (corr {corr:.2f})", fontsize=_FS)
     ax.set_xlabel("Date")
     ax.set_ylabel("Cumulative return")
-    ax.legend(fontsize=8, loc="upper left")
+    ax.legend(fontsize=_FSS, loc="upper left")
     ax.grid(True, alpha=0.3)
 
 
@@ -471,13 +479,13 @@ def _plot_front_vs_back(ax, asset_obj, asset_obj_back, exec_sig, pnl, cum_pnl) -
                 label=f"次月  (SR {sharpe_back:.2f})", alpha=0.85)
     else:
         ax.text(0.5, 0.5, "次月 data unavailable", transform=ax.transAxes,
-                ha="center", va="center", fontsize=9)
+                ha="center", va="center", fontsize=_FS)
 
     ax.axhline(0, color="white", linewidth=0.5, linestyle="--", alpha=0.4)
-    ax.set_title("近月 vs 次月 signal PnL", fontsize=10)
+    ax.set_title("近月 vs 次月 signal PnL", fontsize=_FS)
     ax.set_xlabel("Date")
     ax.set_ylabel("Cumulative return")
-    ax.legend(fontsize=8, loc="upper left")
+    ax.legend(fontsize=_FSS, loc="upper left")
     ax.grid(True, alpha=0.3)
 
 
@@ -488,7 +496,7 @@ def _plot_casr(ax, pnl: pd.Series, trading_index: pd.DatetimeIndex,
         result = _ops.Caar(window, pnl.reindex(trading_index))
     except ValueError as e:
         ax.text(0.5, 0.5, str(e), transform=ax.transAxes,
-                ha="center", va="center", fontsize=9)
+                ha="center", va="center", fontsize=_FS)
         return
 
     x      = result.index
@@ -503,10 +511,10 @@ def _plot_casr(ax, pnl: pd.Series, trading_index: pd.DatetimeIndex,
     ax.fill_between(x, cum_lo, cum_hi, alpha=0.2, color="#4fc3f7", label="±1 SE")
     ax.axvline(0, color="white", linewidth=0.9, linestyle="--", alpha=0.7, label="expiry")
     ax.axhline(0, color="white", linewidth=0.5, linestyle="--", alpha=0.4)
-    ax.set_title(f"CASR ±{window}d around expiry", fontsize=10)
+    ax.set_title(f"CASR ±{window}d around expiry", fontsize=_FS)
     ax.set_xlabel("Days relative to expiry")
     ax.set_ylabel("Cumulative avg signal return")
-    ax.legend(fontsize=8)
+    ax.legend(fontsize=_FSS)
     ax.grid(True, alpha=0.3)
 
 
@@ -523,10 +531,10 @@ def _plot_cost_summary(ax, pnl, cum_pnl, pnl_net, cum_pnl_net, tcost) -> None:
     ax.plot(cum_tc.index,      cum_tc.values,       linewidth=1.0, color="#ef5350",
             label="cum transaction cost", linestyle="--")
     ax.axhline(0, color="white", linewidth=0.5, linestyle="--", alpha=0.4)
-    ax.set_title("PnL vs transaction cost", fontsize=10)
+    ax.set_title("PnL vs transaction cost", fontsize=_FS)
     ax.set_xlabel("Date")
     ax.set_ylabel("Cumulative return")
-    ax.legend(fontsize=8, loc="upper left")
+    ax.legend(fontsize=_FSS, loc="upper left")
     ax.grid(True, alpha=0.3)
 
 
@@ -611,25 +619,25 @@ def SimulateAll(
         ax_pnl.fill_between(cum_pnl.index, cum_pnl.values, 0,
                             where=(cum_pnl.values <  0), alpha=0.15, color="#ef5350")
         ax_pnl.axhline(0, color="grey", linewidth=0.5, linestyle="--")
-        ax_pnl.set_title(f"{name}  —  Cum PnL  (Sharpe {sharpe:.2f})", fontsize=9)
+        ax_pnl.set_title(f"{name}  —  Cum PnL  (Sharpe {sharpe:.2f})", fontsize=_FS)
         ax_pnl.set_ylabel("Cum return")
         ax_pnl.grid(True, alpha=0.3)
 
         # ── right: daily PnL bars + turnover ─────────────────────────────────
         bar_colors = ["#26a69a" if v >= 0 else "#ef5350" for v in pnl.fillna(0)]
         ax_to.bar(pnl.index, pnl.values, color=bar_colors, alpha=0.6, width=1)
-        ax_to.set_ylabel("Daily PnL", fontsize=8)
+        ax_to.set_ylabel("Daily PnL", fontsize=_FSS)
         ax_to.grid(True, alpha=0.2)
 
         ax2 = ax_to.twinx()
         ax2.plot(turnover.index, turnover.values,
                  color="orange", linewidth=0.9, alpha=0.85, label="Turnover (20d avg)")
-        ax2.set_ylabel("Turnover", fontsize=8, color="orange")
+        ax2.set_ylabel("Turnover", fontsize=_FSS, color="orange")
         ax2.tick_params(axis="y", labelcolor="orange")
-        ax2.legend(loc="upper right", fontsize=7)
+        ax2.legend(loc="upper right", fontsize=_FSS)
 
         avg_to = float(exec_sig.diff().abs().mean())
-        ax_to.set_title(f"{name}  —  Daily PnL  (avg turnover {avg_to:.3f})", fontsize=9)
+        ax_to.set_title(f"{name}  —  Daily PnL  (avg turnover {avg_to:.3f})", fontsize=_FS)
 
     # hide any unused axes in the last row
     for j in range(n, n_rows * 2):
