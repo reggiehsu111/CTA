@@ -165,7 +165,7 @@ def main() -> None:
                         help="Seconds to wait between annual requests")
     args = parser.parse_args()
 
-    end_year = args.end_year or datetime.date.today().year
+    end_year = args.end_year or datetime.date.today().year - 1
 
     with requests.Session() as session:
 
