@@ -127,6 +127,48 @@ def Lead(n: int, s: pd.Series) -> pd.Series:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Filter / mask
+# ─────────────────────────────────────────────────────────────────────────────
+
+def Filter(signal: pd.Series, mask) -> pd.Series:
+    """
+    Filter a signal by a 0/1 or boolean mask, mirroring f-package
+    `BaseMatrix / mask` semantics.
+
+        signal / mask  →  signal where mask is truthy, NaN elsewhere
+
+    Internally: any 0s in the mask are first replaced with NaN, then
+    we divide so that filtered-out positions become NaN (not inf, not 0).
+    NaN means "no position" downstream — `exec_sig.shift(2) * returns`
+    propagates the NaN, and `pnl.cumsum()` skips it.
+
+    Parameters
+    ----------
+    signal : pd.Series
+        Date-indexed signal series.
+    mask : pd.Series | array-like
+        Same length / index as signal. Truthy (1, True) keeps the signal,
+        falsy (0, False) drops it.
+
+    Examples
+    --------
+        # Only trade when realised vol is in the top quintile
+        vol      = cta.InstStdev(20, cta.Returns('c', -1))
+        high_vol = vol > vol.rolling(252).quantile(0.8)
+        sig_hv   = cta.Filter(my_sig, high_vol)
+
+        # Equivalent inline form using the / operator on pandas:
+        sig_hv   = my_sig / high_vol.astype(float).replace(0, np.nan)
+    """
+    if isinstance(mask, pd.Series):
+        m = mask.reindex(signal.index).astype(float)
+    else:
+        m = pd.Series(mask, index=signal.index).astype(float)
+    m = m.where(m != 0)                                  # zeros → NaN
+    return (signal / m).replace([np.inf, -np.inf], np.nan)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Fill
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -336,6 +378,7 @@ __all__ = [
     "set_active_asset",
     "Prices", "Returns",
     "Lag", "Lead",
+    "Filter",
     "ForwardFill",
     "InstMean", "InstStdev", "InstSkew", "InstSum",
     "InstRank", "InstZScore",

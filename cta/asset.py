@@ -19,12 +19,16 @@ import numpy as np
 import pandas as pd
 
 
-_OHLCV = ["open", "high", "low", "close", "volume"]
+_OHLCV    = ["open", "high", "low", "close", "volume"]
+_EXTRA    = ["settlement", "oi", "bid", "ask"]   # optional — present when loaded from TAIFEX CSV
 
 
 class BaseAsset(pd.DataFrame):
     """
-    Single-instrument OHLCV container.
+    Single-instrument OHLCV container with optional extra columns.
+
+    Required columns : open, high, low, close, volume
+    Optional columns : settlement, oi (open interest), bid, ask
 
     Analogous to BaseMatrix in the f-package but for a single time series
     instead of a cross-sectional universe.
@@ -65,8 +69,9 @@ class BaseAsset(pd.DataFrame):
         symbol: str = "",
         time_granularity: str = "1d",
     ) -> "BaseAsset":
-        """Wrap an existing OHLCV DataFrame as a BaseAsset."""
-        return cls(data=df[_OHLCV].copy(), symbol=symbol, time_granularity=time_granularity)
+        """Wrap a DataFrame as a BaseAsset, preserving any extra known columns."""
+        keep = _OHLCV + [c for c in _EXTRA if c in df.columns]
+        return cls(data=df[keep].copy(), symbol=symbol, time_granularity=time_granularity)
 
     # ── column accessors ──────────────────────────────────────────────────────
 
@@ -89,6 +94,36 @@ class BaseAsset(pd.DataFrame):
     @property
     def volume(self) -> pd.Series:
         return self["volume"]
+
+    @property
+    def settlement(self) -> pd.Series:
+        """Daily settlement price (結算價)."""
+        return self["settlement"] if "settlement" in self.columns else pd.Series(dtype=float)
+
+    @property
+    def oi(self) -> pd.Series:
+        """Open interest — number of outstanding contracts (未沖銷契約數)."""
+        return self["oi"] if "oi" in self.columns else pd.Series(dtype=float)
+
+    @property
+    def bid(self) -> pd.Series:
+        """Closing best bid price (最後最佳買價)."""
+        return self["bid"] if "bid" in self.columns else pd.Series(dtype=float)
+
+    @property
+    def ask(self) -> pd.Series:
+        """Closing best ask price (最後最佳賣價)."""
+        return self["ask"] if "ask" in self.columns else pd.Series(dtype=float)
+
+    @property
+    def spread(self) -> pd.Series:
+        """Closing bid-ask spread in index points (ask − bid)."""
+        return (self.ask - self.bid).rename("spread")
+
+    @property
+    def mid(self) -> pd.Series:
+        """Closing mid price (bid + ask) / 2."""
+        return ((self.bid + self.ask) / 2).rename("mid")
 
     # ── derived series ────────────────────────────────────────────────────────
 
