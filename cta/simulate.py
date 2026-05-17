@@ -32,6 +32,66 @@ import pandas as pd
 from .asset import BaseAsset
 from . import operators as _ops
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Global date-range state — used by Simulate / SimulateAll / simulate_by_dollars
+# / simulate_midday_short_night_long when their own start_date/end_date args
+# are left as None. Set once at the top of a notebook for train/test splits.
+# ─────────────────────────────────────────────────────────────────────────────
+
+_global_date_range: dict = {"start": None, "end": None}
+
+
+def set_date_range(start_date=None, end_date=None) -> None:
+    """
+    Set the default evaluation window used by every Simulate / SimulateAll /
+    simulate_by_dollars / simulate_midday_short_night_long call that does not
+    explicitly pass `start_date` / `end_date`.
+
+    Pass `None` for either bound to mean 'no limit on that side'.
+
+        cta.set_date_range(start_date="2017-01-01", end_date="2022-12-31")
+        cta.Simulate(sig)        # train window
+        cta.set_date_range(start_date="2023-01-01", end_date=None)
+        cta.Simulate(sig)        # test window
+    """
+    _global_date_range["start"] = pd.Timestamp(start_date) if start_date is not None else None
+    _global_date_range["end"]   = pd.Timestamp(end_date)   if end_date   is not None else None
+
+
+def get_date_range() -> tuple:
+    """Return (start, end) — the globally set defaults."""
+    return _global_date_range["start"], _global_date_range["end"]
+
+
+def _resolve_dates(start_date, end_date) -> tuple:
+    """Explicit args win; fall back to global state. Both default to None."""
+    start = start_date if start_date is not None else _global_date_range["start"]
+    end   = end_date   if end_date   is not None else _global_date_range["end"]
+    if start is not None:
+        start = pd.Timestamp(start)
+    if end is not None:
+        end = pd.Timestamp(end)
+    return start, end
+
+
+def _subset_asset(asset_obj: BaseAsset, eval_idx: pd.DatetimeIndex) -> BaseAsset:
+    """Return a new BaseAsset restricted to `eval_idx`, preserving metadata."""
+    df = pd.DataFrame(asset_obj).loc[eval_idx]
+    return BaseAsset.from_df(
+        df, symbol=asset_obj.symbol, time_granularity=asset_obj.time_granularity,
+    )
+
+
+def _slice_index(full_idx: pd.DatetimeIndex, start, end) -> pd.DatetimeIndex:
+    """Return the subset of full_idx within [start, end] (inclusive). Either may be None."""
+    idx = full_idx
+    if start is not None:
+        idx = idx[idx >= start]
+    if end is not None:
+        idx = idx[idx <= end]
+    return idx
+
 # Module-level matplotlib state mutations have been removed — they were
 # being re-applied on every importlib.reload(cta.simulate), which corrupted
 # the Jupyter inline backend across cells.
@@ -218,16 +278,26 @@ def _load_asset(asset: str, time_granularity: str, contract: str = "front") -> B
     for col in ["open", "high", "low", "close", "volume", "settlement", "oi", "bid", "ask"]:
         df[col] = pd.to_numeric(df[col].replace("-", np.nan), errors="coerce")
 
-    regular = df[df["session"] == "一般"].copy()
-    regular["expiry_int"] = pd.to_numeric(regular["expiry"], errors="coerce")
-
-    # Sort by expiry ascending per date; rank 0 = 近月, rank 1 = 次月
-    regular = regular.sort_values(["date", "expiry_int"])
-    regular["_rank"] = regular.groupby("date").cumcount()
+    # ── Day session (一般) — select front/back contract per date ─────────────
+    day = df[df["session"] == "一般"].copy()
+    day["expiry_int"] = pd.to_numeric(day["expiry"], errors="coerce")
+    day = day.sort_values(["date", "expiry_int"])
+    day["_rank"] = day.groupby("date").cumcount()
     rank = 0 if contract == "front" else 1
-    selected = regular[regular["_rank"] == rank].drop(columns=["expiry_int", "_rank"])
+    selected = day[day["_rank"] == rank].drop(columns=["expiry_int", "_rank", "session"])
 
-    series = selected.set_index("date").sort_index()
+    # ── Night session (盤後) — match to the same (date, expiry) ─────────────
+    night_cols = ["date", "expiry", "open", "high", "low", "close", "volume"]
+    night = df[df["session"] == "盤後"][night_cols].rename(columns={
+        "open":   "night_open",
+        "high":   "night_high",
+        "low":    "night_low",
+        "close":  "night_close",
+        "volume": "night_volume",
+    })
+    merged = selected.merge(night, on=["date", "expiry"], how="left")
+
+    series = merged.set_index("date").sort_index()
     series = series.dropna(subset=["open", "high", "low", "close"])
 
     symbol = code if contract == "front" else f"{code}_back"
@@ -341,23 +411,28 @@ def simulate(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Plot — layout  (3 cols × 4 rows)
+# Plot — layout  (3 cols × 5 rows)
 #
 #   (0,0) Cum PnL (close)         (0,1) Multi-price cum PnL    (0,2) Turnover
 #   (1,0) Signal vs buy-hold      (1,1) Front vs back          (1,2) By weekday
 #   (2,0) By day of month         (2,1) By year (doy)          (2,2) PnL vs tcost
 #   (3,0) CASR around expiry      (3,1) Cum active return      (3,2) Vol-matched
+#   (4,0) CASR around TSMC EA     (4,1) PnL by session         (4,2) —
 # ─────────────────────────────────────────────────────────────────────────────
 
 _FS  = 15   # subplot title fontsize
 _FSS = 13   # axis label / legend fontsize
 
+# Default location of the TSMC earnings-announcement CSV (TWSE format).
+from pathlib import Path as _Path
+_DEFAULT_TSMC_EA_PATH = _Path(__file__).parent.parent / "tsmc_ea.csv"
+
 
 def _plot(asset_obj, asset_obj_back, signal, exec_sig, pnl, cum_pnl,
           tcost, pnl_net, cum_pnl_net):
-    fig = plt.figure(figsize=(30, 32))
-    gs  = gridspec.GridSpec(4, 3, figure=fig, hspace=0.55, wspace=0.30)
-    axes = [[fig.add_subplot(gs[r, c]) for c in range(3)] for r in range(4)]
+    fig = plt.figure(figsize=(30, 40))
+    gs  = gridspec.GridSpec(5, 3, figure=fig, hspace=0.55, wspace=0.30)
+    axes = [[fig.add_subplot(gs[r, c]) for c in range(3)] for r in range(5)]
 
     _plot_cum_pnl(axes[0][0], pnl, cum_pnl)
     _plot_price_comparison(axes[0][1], asset_obj, exec_sig)
@@ -374,6 +449,10 @@ def _plot(asset_obj, asset_obj_back, signal, exec_sig, pnl, cum_pnl,
     _plot_casr(axes[3][0], signal, asset_obj)
     _plot_active_return(axes[3][1], asset_obj, pnl)
     _plot_vol_matched(axes[3][2], asset_obj, pnl)
+
+    _plot_tsmc_ea_casr(axes[4][0], signal, asset_obj, _DEFAULT_TSMC_EA_PATH)
+    _plot_session_breakdown(axes[4][1], asset_obj, exec_sig)
+    axes[4][2].axis("off")
 
     plt.show()
 
@@ -645,34 +724,174 @@ def _plot_front_vs_back(ax, asset_obj, asset_obj_back, exec_sig, pnl, cum_pnl) -
 
 def _plot_casr(ax, signal: pd.Series, asset_obj,
                window: int = 30) -> None:
-    """(3,0) CASR — Lag(2, normalized_signal) * Returns(-1) around expiry dates."""
+    """
+    (3,0) CASR around TAIFEX expiry — signal PnL CASR (blue, with ±1 SE band)
+    overlaid with the asset's buy-and-hold CAR (grey) for the same events,
+    so you can read 'is my signal beating buy-and-hold around expiry?'.
+    """
     trading_index = asset_obj.index
-    casr_pnl = (signal.shift(2) * asset_obj.returns).reindex(trading_index)
+    casr_pnl  = (signal.shift(2) * asset_obj.returns).reindex(trading_index)
+    asset_ret = asset_obj.returns.reindex(trading_index)
     try:
-        result = _ops.Caar(window, casr_pnl)
+        result       = _ops.Caar(window, casr_pnl)
+        result_asset = _ops.Caar(window, asset_ret)
     except ValueError as e:
         ax.text(0.5, 0.5, str(e), transform=ax.transAxes,
                 ha="center", va="center", fontsize=_FS)
         return
 
-    x      = result.index
-    casr   = result["casr"]
-    se     = result["se"]
-    n      = int(result["n"].iloc[0])
-    cum_lo = np.cumsum(result["mean"] - se)
-    cum_hi = np.cumsum(result["mean"] + se)
+    x       = result.index
+    casr    = result["casr"]
+    se      = result["se"]
+    n       = int(result["n"].iloc[0])
+    cum_lo  = np.cumsum(result["mean"] - se)
+    cum_hi  = np.cumsum(result["mean"] + se)
+    bh_casr = result_asset["casr"]
 
     ax.plot(x, casr, linewidth=1.4, color="#1565c0",
             marker="o", markersize=5, markerfacecolor="#1565c0",
             markeredgecolor="white", markeredgewidth=0.6,
-            label=f"CASR  (n={n} expiries)")
-    ax.fill_between(x, cum_lo, cum_hi, alpha=0.2, color="#1565c0", label="±1 SE")
+            label=f"signal CASR  (n={n} expiries)")
+    ax.fill_between(x, cum_lo, cum_hi, alpha=0.2, color="#1565c0", label="±1 SE (signal)")
+    ax.plot(x, bh_casr, linewidth=1.2, color="#424242", linestyle="-", alpha=0.85,
+            label="buy & hold CAR")
     ax.axvline(0, color="#c62828", linewidth=1.2, linestyle="--", alpha=0.8, label="expiry")
     ax.axhline(0, color="black", linewidth=0.8, linestyle="--", alpha=0.5)
-    ax.set_title(f"CASR ±{window}d around expiry", fontsize=_FS)
+    ax.set_title(f"CASR ±{window}d around expiry  (signal vs buy-and-hold)", fontsize=_FS)
     ax.set_xlabel("Days relative to expiry")
-    ax.set_ylabel("Cumulative avg signal return")
+    ax.set_ylabel("Cumulative avg return")
     ax.legend(fontsize=_FSS)
+    ax.grid(True, alpha=0.3)
+
+
+def _plot_tsmc_ea_casr(ax, signal: pd.Series, asset_obj,
+                        ea_path, window: int = 10) -> None:
+    """
+    (4,0) CASR around TSMC earnings-announcement / investor-day events.
+
+    Loads the dates from `ea_path` (TWSE Big5 CSV), maps midnight events
+    to the next day, snaps to trading days, then computes the cumulative
+    average signal return in a ±`window`-day window around each event.
+    """
+    trading_index = asset_obj.index
+
+    try:
+        ea_dates = _ops.load_tsmc_ea_dates(ea_path, trading_index)
+    except FileNotFoundError as e:
+        ax.text(0.5, 0.5, f"TSMC EA CSV not found:\n{e}",
+                transform=ax.transAxes, ha="center", va="center", fontsize=_FSS)
+        ax.set_title("CASR — TSMC earnings announcements", fontsize=_FS)
+        return
+    except Exception as e:
+        ax.text(0.5, 0.5, f"Failed to load TSMC EA: {e}",
+                transform=ax.transAxes, ha="center", va="center", fontsize=_FSS)
+        ax.set_title("CASR — TSMC earnings announcements", fontsize=_FS)
+        return
+
+    if len(ea_dates) == 0:
+        ax.text(0.5, 0.5, "No TSMC EA events in the asset's trading range",
+                transform=ax.transAxes, ha="center", va="center", fontsize=_FSS)
+        ax.set_title("CASR — TSMC earnings announcements", fontsize=_FS)
+        return
+
+    casr_pnl  = (signal.shift(2) * asset_obj.returns).reindex(trading_index)
+    asset_ret = asset_obj.returns.reindex(trading_index)
+
+    try:
+        result       = _ops.Caar(window, casr_pnl,  event_dates=ea_dates)
+        result_asset = _ops.Caar(window, asset_ret, event_dates=ea_dates)
+    except ValueError as e:
+        ax.text(0.5, 0.5, str(e), transform=ax.transAxes,
+                ha="center", va="center", fontsize=_FSS)
+        return
+
+    x       = result.index
+    casr    = result["casr"]
+    se      = result["se"]
+    n       = int(result["n"].iloc[0])
+    cum_lo  = np.cumsum(result["mean"] - se)
+    cum_hi  = np.cumsum(result["mean"] + se)
+    bh_casr = result_asset["casr"]
+
+    ax.plot(x, casr, linewidth=1.4, color="#e65100",
+            marker="o", markersize=5, markerfacecolor="#e65100",
+            markeredgecolor="white", markeredgewidth=0.6,
+            label=f"signal CASR  (n={n} TSMC EAs)")
+    ax.fill_between(x, cum_lo, cum_hi, alpha=0.2, color="#e65100", label="±1 SE (signal)")
+    ax.plot(x, bh_casr, linewidth=1.2, color="#424242", linestyle="-", alpha=0.85,
+            label="buy & hold CAR")
+    ax.axvline(0, color="#c62828", linewidth=1.2, linestyle="--", alpha=0.8, label="EA date")
+    ax.axhline(0, color="black", linewidth=0.8, linestyle="--", alpha=0.5)
+    ax.set_title(f"CASR ±{window}d around TSMC EAs  (signal vs buy-and-hold)", fontsize=_FS)
+    ax.set_xlabel("Days relative to EA")
+    ax.set_ylabel("Cumulative avg return")
+    ax.legend(fontsize=_FSS)
+    ax.grid(True, alpha=0.3)
+
+
+def _plot_session_breakdown(ax, asset_obj, exec_sig: pd.Series) -> None:
+    """
+    (4,1) Cumulative signal PnL decomposed into four intraday windows.
+
+        ret[t] = close[t] / close[t-1] - 1   (the bar's close-to-close return)
+              ≈ mid[t] + night[t] + over[t] + day[t]
+
+    where:
+        mid[t]   = night_open[t-1] / close[t-1]      - 1   (gap into 夜盤)
+        night[t] = night_close[t-1] / night_open[t-1] - 1   (夜盤 session)
+        over[t]  = open[t] / night_close[t-1]        - 1   (gap into next 日盤)
+        day[t]   = close[t] / open[t]                - 1   (日盤 session)
+
+    Pre-2017 (no 夜盤 data) `mid` and `night` are 0 and `over` falls back
+    to `open[t] / close[t-1] - 1` so the four components still sum to ret.
+    """
+    close = asset_obj.close
+    open_ = asset_obj.open
+
+    has_night = ("night_open" in asset_obj.columns and "night_close" in asset_obj.columns
+                 and asset_obj["night_open"].notna().any())
+
+    if has_night:
+        no  = asset_obj.night_open
+        nc  = asset_obj.night_close
+        mid_ret   = (no.shift(1) / close.shift(1) - 1).fillna(0)
+        night_ret = (nc.shift(1) / no.shift(1)    - 1).fillna(0)
+        # Use night_close where available, fall back to prev day's close for pre-夜盤 era
+        over_base = nc.shift(1).fillna(close.shift(1))
+        over_ret  = (open_ / over_base - 1).fillna(0)
+    else:
+        mid_ret   = pd.Series(0.0, index=close.index)
+        night_ret = pd.Series(0.0, index=close.index)
+        over_ret  = (open_ / close.shift(1) - 1).fillna(0)
+
+    day_ret = (close / open_ - 1).fillna(0)
+
+    day_pnl   = (exec_sig * day_ret).fillna(0)
+    mid_pnl   = (exec_sig * mid_ret).fillna(0)
+    night_pnl = (exec_sig * night_ret).fillna(0)
+    over_pnl  = (exec_sig * over_ret).fillna(0)
+
+    cum_day   = day_pnl.cumsum()
+    cum_mid   = mid_pnl.cumsum()
+    cum_night = night_pnl.cumsum()
+    cum_over  = over_pnl.cumsum()
+    cum_total = (day_pnl + mid_pnl + night_pnl + over_pnl).cumsum()
+
+    ax.plot(cum_day.index,   cum_day.values,   color="#1565c0", linewidth=1.2,
+            label=f"日盤 day session  (SR {_sharpe(day_pnl):+.2f})")
+    ax.plot(cum_mid.index,   cum_mid.values,   color="#e65100", linewidth=1.2,
+            label=f"Mid-day gap  (SR {_sharpe(mid_pnl):+.2f})")
+    ax.plot(cum_night.index, cum_night.values, color="#6a1b9a", linewidth=1.2,
+            label=f"夜盤 night session  (SR {_sharpe(night_pnl):+.2f})")
+    ax.plot(cum_over.index,  cum_over.values,  color="#00897b", linewidth=1.2,
+            label=f"Overnight gap  (SR {_sharpe(over_pnl):+.2f})")
+    ax.plot(cum_total.index, cum_total.values, color="black", linewidth=0.8,
+            linestyle="--", alpha=0.5, label="sum (≈ close-to-close)")
+    ax.axhline(0, color="black", linewidth=0.8, linestyle="--", alpha=0.5)
+    ax.set_title("Cumulative PnL by intraday session", fontsize=_FS)
+    ax.set_xlabel("Date")
+    ax.set_ylabel("Cumulative return contribution")
+    ax.legend(fontsize=_FSS, loc="upper left")
     ax.grid(True, alpha=0.3)
 
 

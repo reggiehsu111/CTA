@@ -20,7 +20,11 @@ import pandas as pd
 
 
 _OHLCV    = ["open", "high", "low", "close", "volume"]
-_EXTRA    = ["settlement", "oi", "bid", "ask"]   # optional — present when loaded from TAIFEX CSV
+_EXTRA    = [
+    "settlement", "oi", "bid", "ask",
+    # After-hours / 盤後 session OHLCV — present from 2017+ for TAIFEX index futures
+    "night_open", "night_high", "night_low", "night_close", "night_volume",
+]
 
 
 class BaseAsset(pd.DataFrame):
@@ -124,6 +128,30 @@ class BaseAsset(pd.DataFrame):
     def mid(self) -> pd.Series:
         """Closing mid price (bid + ask) / 2."""
         return ((self.bid + self.ask) / 2).rename("mid")
+
+    # ── After-hours (盤後 / night) session ─────────────────────────────────────
+
+    @property
+    def night_open(self) -> pd.Series:
+        """Opening price of the after-hours session (~15:00 TWSE time)."""
+        return self["night_open"] if "night_open" in self.columns else pd.Series(dtype=float)
+
+    @property
+    def night_high(self) -> pd.Series:
+        return self["night_high"] if "night_high" in self.columns else pd.Series(dtype=float)
+
+    @property
+    def night_low(self) -> pd.Series:
+        return self["night_low"] if "night_low" in self.columns else pd.Series(dtype=float)
+
+    @property
+    def night_close(self) -> pd.Series:
+        """Closing price of the after-hours session (~05:00 next-day TWSE time)."""
+        return self["night_close"] if "night_close" in self.columns else pd.Series(dtype=float)
+
+    @property
+    def night_volume(self) -> pd.Series:
+        return self["night_volume"] if "night_volume" in self.columns else pd.Series(dtype=float)
 
     # ── derived series ────────────────────────────────────────────────────────
 

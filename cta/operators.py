@@ -256,6 +256,98 @@ def PctChange(n: int, s: pd.Series) -> pd.Series:
 # Event study
 # ─────────────────────────────────────────────────────────────────────────────
 
+def load_tsmc_ea_dates(
+    path,
+    trading_index: pd.DatetimeIndex,
+    midnight_to_next_day: bool = True,
+) -> pd.DatetimeIndex:
+    """
+    Load TSMC earnings-announcement / investor-relations event dates from the
+    TWSE-format CSV `tsmc_ea.csv` and snap them to trading days.
+
+    The CSV is Big5-encoded with ROC dates (e.g. '115/04/25' = 2026-04-25).
+    Column layout (zero-indexed):
+        0 公司代號     1 公司名稱   2 召開法人說明會日期 (date)
+        3 召開法人說明會時間 (time)  4 召開法人說明會地點    ...
+
+    Date handling
+    -------------
+    * ROC year + 1911 → Gregorian year.
+    * Date ranges like '115/03/03 至 115/03/06' use the **start** date.
+    * If `midnight_to_next_day` and the time field begins with '00:00',
+      the event is shifted forward by one calendar day. This implements
+      the convention "midnight events map to the next day", on the
+      assumption that 00:00 entries represent overnight events whose
+      market impact lands on the next session.
+    * Each event is then snapped *forward* to the next available trading
+      day in `trading_index` (skipping weekends / holidays).
+    * Events outside `trading_index` are dropped.
+
+    Returns
+    -------
+    pd.DatetimeIndex of unique, sorted trading-day-aligned event dates.
+    """
+    import csv
+    from pathlib import Path
+
+    path = Path(path)
+    if not path.exists():
+        raise FileNotFoundError(f"TSMC EA CSV not found: {path}")
+
+    if trading_index is None or len(trading_index) == 0:
+        return pd.DatetimeIndex([])
+
+    events: list[pd.Timestamp] = []
+    with open(path, encoding="big5", errors="replace", newline="") as f:
+        reader = csv.reader(f)
+        try:
+            next(reader)            # skip header
+        except StopIteration:
+            return pd.DatetimeIndex([])
+        for row in reader:
+            if len(row) < 4:
+                continue
+            date_field = row[2].strip()
+            time_field = row[3].strip()
+            if not date_field:
+                continue
+
+            # Range like "115/03/03 至 115/03/06" → take the start date.
+            date_str = date_field.split()[0]
+
+            parts = date_str.split("/")
+            if len(parts) != 3:
+                continue
+            try:
+                year_roc, month, day = int(parts[0]), int(parts[1]), int(parts[2])
+            except ValueError:
+                continue
+            try:
+                event_date = pd.Timestamp(year=year_roc + 1911, month=month, day=day)
+            except (ValueError, OverflowError):
+                continue
+
+            if midnight_to_next_day and time_field.startswith("00:00"):
+                event_date = event_date + pd.Timedelta(days=1)
+
+            events.append(event_date)
+
+    if not events:
+        return pd.DatetimeIndex([])
+
+    events_idx = pd.DatetimeIndex(sorted(set(events)))
+
+    # Snap each event forward to the next available trading day.
+    snapped: list[pd.Timestamp] = []
+    last_pos = len(trading_index)
+    for ev in events_idx:
+        pos = trading_index.searchsorted(ev, side="left")
+        if pos < last_pos:
+            snapped.append(trading_index[pos])
+
+    return pd.DatetimeIndex(sorted(set(snapped)))
+
+
 def _taifex_expiry_dates(trading_index: pd.DatetimeIndex) -> pd.DatetimeIndex:
     """Third Wednesday of every month, snapped to the nearest trading day."""
     cur    = trading_index[0].replace(day=1)
@@ -272,54 +364,97 @@ def _taifex_expiry_dates(trading_index: pd.DatetimeIndex) -> pd.DatetimeIndex:
     return pd.DatetimeIndex(sorted(set(dates)))
 
 
+def _event_positions(event_dates: pd.DatetimeIndex,
+                     trading_index: pd.DatetimeIndex) -> np.ndarray:
+    """Integer positions of event dates within `trading_index` (sorted, deduped)."""
+    if len(event_dates) == 0:
+        return np.array([], dtype=int)
+    positions = np.array([
+        trading_index.searchsorted(ed, side="right") - 1
+        for ed in event_dates
+    ])
+    positions = positions[(positions >= 0) & (positions < len(trading_index))]
+    return np.sort(np.unique(positions))
+
+
+def _signed_event_distance(trading_index: pd.DatetimeIndex,
+                           positions:     np.ndarray) -> np.ndarray:
+    """
+    Signed trading-day distance from each bar to the nearest event position.
+
+    Convention:
+        0  = on an event day
+        -N = N trading days BEFORE the nearest upcoming event
+        +N = N trading days AFTER the most recent past event
+    """
+    n   = len(trading_index)
+    out = np.zeros(n, dtype=int)
+    if len(positions) == 0:
+        return out
+    for i in range(n):
+        ins  = np.searchsorted(positions, i)
+        best = None
+        if ins > 0:
+            d    = i - positions[ins - 1]           # positive: days after prev event
+            best = d
+        if ins < len(positions):
+            d    = i - positions[ins]               # negative (or 0): days before next
+            if best is None or abs(d) < abs(best):
+                best = d
+        out[i] = best if best is not None else 0
+    return out
+
+
 def Event(name: str) -> pd.Series:
     """
-    Signed trading-day distance to the nearest recurring event.
+    Signed trading-day distance to the nearest event of type `name`.
 
     Parameters
     ----------
     name : event type. Currently supported:
-        'optexp' — TAIFEX monthly option/futures expiry (third Wednesday)
+        'optexp'   — TAIFEX monthly futures/options expiry (3rd Wednesday).
+        'tsmc_ea'  — TSMC earnings-announcement / investor-relations events,
+                     loaded from the repo's `tsmc_ea.csv` with midnight events
+                     mapped to the next day and snapped to trading days.
 
     Returns
     -------
     pd.Series of signed integers indexed by the active asset's trading calendar:
-         0  = expiry day itself
-        -N  = N trading days BEFORE the nearest upcoming expiry
-        +N  = N trading days AFTER the most recent past expiry
+         0  = on an event day
+        -N  = N trading days BEFORE the nearest upcoming event
+        +N  = N trading days AFTER the most recent past event
 
     Example
     -------
         cta.load_asset('mtx', '1d')
-        ev = cta.Event('optexp')
-        # ev looks like: ..., -3, -2, -1, 0, 1, 2, 3, ..., 10, ..., -3, -2, -1, 0, ...
+        ev_exp = cta.Event('optexp')
+        ev_ea  = cta.Event('tsmc_ea')
+        # near a TSMC EA: ..., -3, -2, -1, 0, 1, 2, 3, ..., -3, -2, -1, 0, ...
     """
     asset         = _require_asset()
     trading_index = asset.index
 
     if name == "optexp":
-        expiry_dates = _taifex_expiry_dates(trading_index)
-        exp_pos = np.sort(np.array([
-            trading_index.searchsorted(ed, side="right") - 1
-            for ed in expiry_dates
-        ]))
-
-        result = np.empty(len(trading_index), dtype=int)
-        for i in range(len(trading_index)):
-            ins  = np.searchsorted(exp_pos, i)
-            best = None
-            if ins > 0:
-                d    = i - exp_pos[ins - 1]          # positive: days after prev expiry
-                best = d
-            if ins < len(exp_pos):
-                d    = i - exp_pos[ins]              # negative (or 0): days before next
-                if best is None or abs(d) < abs(best):
-                    best = d
-            result[i] = best if best is not None else 0
-
+        event_dates = _taifex_expiry_dates(trading_index)
+        positions   = _event_positions(event_dates, trading_index)
+        result      = _signed_event_distance(trading_index, positions)
         return pd.Series(result, index=trading_index, name="event_optexp")
 
-    raise ValueError(f"Unknown event name '{name}'. Supported: 'optexp'")
+    if name == "tsmc_ea":
+        from pathlib import Path
+        default_path = Path(__file__).parent.parent / "tsmc_ea.csv"
+        if not default_path.exists():
+            raise FileNotFoundError(
+                f"TSMC EA CSV not found at {default_path}. "
+                "Use cta.load_tsmc_ea_dates(path, trading_index) directly "
+                "if your file lives elsewhere."
+            )
+        event_dates = load_tsmc_ea_dates(default_path, trading_index)
+        positions   = _event_positions(event_dates, trading_index)
+        result      = _signed_event_distance(trading_index, positions)
+        return pd.Series(result, index=trading_index, name="event_tsmc_ea")
+
+    raise ValueError(f"Unknown event name '{name}'. Supported: 'optexp', 'tsmc_ea'")
 
 
 def Caar(
@@ -384,4 +519,5 @@ __all__ = [
     "InstRank", "InstZScore",
     "Diff", "PctChange",
     "Event", "Caar",
+    "load_tsmc_ea_dates",
 ]
