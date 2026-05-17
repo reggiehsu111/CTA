@@ -1,5 +1,6 @@
 from .asset import BaseAsset
 from .simulate import simulate, SimulateAll, normalize_signal, load_asset, available_assets
+from .simulate_dollars import simulate_by_dollars
 from .decomposition import RegimeDecomposition
 from .operators import (
     set_active_asset,
@@ -16,6 +17,7 @@ from .operators import (
 __all__ = [
     "BaseAsset",
     "simulate", "SimulateAll", "normalize_signal", "load_asset", "available_assets",
+    "simulate_by_dollars",
     "RegimeDecomposition",
     "set_active_asset", "Prices", "Returns",
     "Lag", "Lead",

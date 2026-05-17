@@ -346,7 +346,7 @@ def simulate(
 #   (0,0) Cum PnL (close)         (0,1) Multi-price cum PnL    (0,2) Turnover
 #   (1,0) Signal vs buy-hold      (1,1) Front vs back          (1,2) By weekday
 #   (2,0) By day of month         (2,1) By year (doy)          (2,2) PnL vs tcost
-#   (3,0) CASR around expiry      (3,1) —                      (3,2) —
+#   (3,0) CASR around expiry      (3,1) Cum active return      (3,2) Vol-matched
 # ─────────────────────────────────────────────────────────────────────────────
 
 _FS  = 15   # subplot title fontsize
@@ -372,8 +372,8 @@ def _plot(asset_obj, asset_obj_back, signal, exec_sig, pnl, cum_pnl,
     _plot_cost_summary(axes[2][2], pnl, cum_pnl, pnl_net, cum_pnl_net, tcost)
 
     _plot_casr(axes[3][0], signal, asset_obj)
-    axes[3][1].axis("off")
-    axes[3][2].axis("off")
+    _plot_active_return(axes[3][1], asset_obj, pnl)
+    _plot_vol_matched(axes[3][2], asset_obj, pnl)
 
     plt.show()
 
@@ -499,8 +499,28 @@ def _plot_by_doy(ax, pnl: pd.Series) -> None:
     ax.grid(True, alpha=0.3)
 
 
+def _alpha_beta(pnl: pd.Series, raw_ret: pd.Series, periods: int = 252) -> tuple[float, float]:
+    """
+    Annualised alpha (intercept) and beta (slope) from OLS:
+        pnl_t = alpha/periods + beta · raw_ret_t + ε_t
+
+    Returns (alpha_annualised, beta).
+    """
+    aligned = pd.concat([pnl, raw_ret], axis=1).dropna()
+    if len(aligned) < 2:
+        return float("nan"), float("nan")
+    y = aligned.iloc[:, 0].values
+    x = aligned.iloc[:, 1].values
+    var_x = x.var(ddof=0)
+    if var_x == 0:
+        return float("nan"), float("nan")
+    beta  = float(((x - x.mean()) * (y - y.mean())).mean() / var_x)
+    alpha_daily = float(y.mean() - beta * x.mean())
+    return alpha_daily * periods, beta
+
+
 def _plot_signal_vs_asset(ax, asset_obj, pnl, cum_pnl) -> None:
-    """(0,3) Signal cumulative PnL vs raw buy-and-hold (weight=1 everywhere)."""
+    """(1,0) Signal cumulative PnL vs buy-and-hold, with alpha/beta decomposition."""
     raw_ret    = asset_obj.returns
     cum_raw    = raw_ret.cumsum().rename("buy_hold")
     sharpe_sig = _sharpe(pnl)
@@ -508,15 +528,90 @@ def _plot_signal_vs_asset(ax, asset_obj, pnl, cum_pnl) -> None:
 
     aligned    = pd.concat([pnl, raw_ret], axis=1).dropna()
     corr       = float(aligned.iloc[:, 0].corr(aligned.iloc[:, 1]))
+    alpha_ann, beta = _alpha_beta(pnl, raw_ret)
 
     ax.plot(cum_pnl.index, cum_pnl.values, linewidth=1.2, color="#1565c0",
             label=f"signal  (SR {sharpe_sig:.2f})")
     ax.plot(cum_raw.index, cum_raw.values, linewidth=1.2, color="#e65100",
             label=f"buy & hold  (SR {sharpe_raw:.2f})", alpha=0.85)
     ax.axhline(0, color="black", linewidth=0.8, linestyle="--", alpha=0.5)
-    ax.set_title(f"Signal vs buy-and-hold  (corr {corr:.2f})", fontsize=_FS)
+    ax.set_title(
+        f"Signal vs buy-and-hold  (corr {corr:+.2f}, "
+        f"β {beta:+.2f}, α {alpha_ann*100:+.2f}%/yr)",
+        fontsize=_FS,
+    )
     ax.set_xlabel("Date")
     ax.set_ylabel("Cumulative return")
+    ax.legend(fontsize=_FSS, loc="upper left")
+    ax.grid(True, alpha=0.3)
+
+
+def _plot_active_return(ax, asset_obj, pnl) -> None:
+    """
+    (3,1) Cumulative active return  cumsum(signal_pnl − buy_hold_ret).
+
+    Diagnostic only — not a metric to optimize. Flat-or-short days on
+    rising markets appear as drawdowns here even when the signal made
+    the correct call.
+    """
+    raw_ret  = asset_obj.returns
+    aligned  = pd.concat([pnl, raw_ret], axis=1).dropna()
+    active   = (aligned.iloc[:, 0] - aligned.iloc[:, 1])
+    cum_act  = active.cumsum()
+    ir       = _sharpe(active)
+
+    ax.plot(cum_act.index, cum_act.values, linewidth=1.2, color="#6a1b9a")
+    ax.fill_between(cum_act.index, cum_act.values, 0,
+                    where=(cum_act.values >= 0), alpha=0.20, color="#00897b")
+    ax.fill_between(cum_act.index, cum_act.values, 0,
+                    where=(cum_act.values <  0), alpha=0.20, color="#c62828")
+    ax.axhline(0, color="black", linewidth=0.8, linestyle="--", alpha=0.5)
+    ax.set_title(
+        f"Cum active return (signal − B&H)  IR {ir:+.2f}\n"
+        f"⚠ misleading when signal is flat/short — diagnostic only",
+        fontsize=_FS,
+    )
+    ax.set_xlabel("Date")
+    ax.set_ylabel("Cumulative excess vs B&H")
+    ax.grid(True, alpha=0.3)
+
+
+def _plot_vol_matched(ax, asset_obj, pnl, target_vol: float = 0.15,
+                       periods: int = 252) -> None:
+    """
+    (3,2) Vol-matched cumulative PnL — both signal and buy-and-hold
+    rescaled (ex-post, constant leverage) to the same annualised vol.
+    This is the honest 'did the signal beat the market?' comparison.
+    """
+    raw_ret  = asset_obj.returns
+    aligned  = pd.concat([pnl, raw_ret], axis=1).dropna()
+    sig_r    = aligned.iloc[:, 0]
+    bh_r     = aligned.iloc[:, 1]
+
+    sig_vol = float(sig_r.std() * np.sqrt(periods))
+    bh_vol  = float(bh_r.std()  * np.sqrt(periods))
+
+    sig_scale = target_vol / sig_vol if sig_vol > 0 else 0.0
+    bh_scale  = target_vol / bh_vol  if bh_vol  > 0 else 0.0
+
+    cum_sig = (sig_r * sig_scale).cumsum()
+    cum_bh  = (bh_r  * bh_scale).cumsum()
+
+    sr_sig = _sharpe(sig_r)
+    sr_bh  = _sharpe(bh_r)
+
+    ax.plot(cum_sig.index, cum_sig.values, linewidth=1.2, color="#1565c0",
+            label=f"signal × {sig_scale:.2f}  (SR {sr_sig:+.2f})")
+    ax.plot(cum_bh.index,  cum_bh.values,  linewidth=1.2, color="#e65100",
+            label=f"B&H × {bh_scale:.2f}  (SR {sr_bh:+.2f})", alpha=0.85)
+    ax.axhline(0, color="black", linewidth=0.8, linestyle="--", alpha=0.5)
+    ax.set_title(
+        f"Vol-matched cum PnL  (both ≈ {target_vol*100:.0f}% ann. vol)\n"
+        f"Sharpe is leverage-invariant → this is the honest comparison",
+        fontsize=_FS,
+    )
+    ax.set_xlabel("Date")
+    ax.set_ylabel("Cumulative return (vol-matched)")
     ax.legend(fontsize=_FSS, loc="upper left")
     ax.grid(True, alpha=0.3)
 
