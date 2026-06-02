@@ -24,6 +24,8 @@ _EXTRA    = [
     "settlement", "oi", "bid", "ask",
     # After-hours / 盤後 session OHLCV — present from 2017+ for TAIFEX index futures
     "night_open", "night_high", "night_low", "night_close", "night_volume",
+    # Back-month (rank+1) close & both contract identifiers — for rollover-aware returns
+    "back_close", "front_expiry", "back_expiry",
 ]
 
 
@@ -38,13 +40,15 @@ class BaseAsset(pd.DataFrame):
     instead of a cross-sectional universe.
     """
 
-    _metadata = ["symbol", "time_granularity", "start_time", "end_time"]
+    _metadata = ["symbol", "time_granularity", "start_time", "end_time",
+                  "periods_per_year"]
 
     def __init__(
         self,
         data: pd.DataFrame | None = None,
         symbol: str = "",
         time_granularity: str = "1d",
+        periods_per_year: int | None = None,
     ):
         if data is None:
             data = pd.DataFrame(columns=_OHLCV)
@@ -60,6 +64,20 @@ class BaseAsset(pd.DataFrame):
         self.start_time       = pd.Timestamp(data.index[0])  if len(data) else pd.NaT
         self.end_time         = pd.Timestamp(data.index[-1]) if len(data) else pd.NaT
 
+        # Bars per year — used by Sharpe annualisation. TAIFEX MXF intraday:
+        # day session 300 min/d + night session 840 min/d ≈ 1140 bars/d × 252 ≈ 287k.
+        # We round to a clean default that the user can override at load time.
+        if periods_per_year is None:
+            periods_per_year = {
+                "1d":  252,
+                "1h":  252 * 19,        # 19 trading hours/day  (5 day + 14 night)
+                "30m": 252 * 38,
+                "15m": 252 * 76,
+                "5m":  252 * 228,
+                "1m":  252 * 1140,      # 300 day + 840 night
+            }.get(time_granularity, 252)
+        self.periods_per_year = int(periods_per_year)
+
     # ── pandas plumbing ───────────────────────────────────────────────────────
 
     @property
@@ -72,10 +90,16 @@ class BaseAsset(pd.DataFrame):
         df: pd.DataFrame,
         symbol: str = "",
         time_granularity: str = "1d",
+        periods_per_year: int | None = None,
     ) -> "BaseAsset":
         """Wrap a DataFrame as a BaseAsset, preserving any extra known columns."""
         keep = _OHLCV + [c for c in _EXTRA if c in df.columns]
-        return cls(data=df[keep].copy(), symbol=symbol, time_granularity=time_granularity)
+        return cls(
+            data=df[keep].copy(),
+            symbol=symbol,
+            time_granularity=time_granularity,
+            periods_per_year=periods_per_year,
+        )
 
     # ── column accessors ──────────────────────────────────────────────────────
 
@@ -153,12 +177,90 @@ class BaseAsset(pd.DataFrame):
     def night_volume(self) -> pd.Series:
         return self["night_volume"] if "night_volume" in self.columns else pd.Series(dtype=float)
 
+    # ── rollover handling ─────────────────────────────────────────────────────
+
+    @property
+    def is_rollover(self) -> pd.Series:
+        """
+        Boolean series — True on days where the front-month contract differs
+        from yesterday's front. Requires the `front_expiry` column (added by
+        the standard loader). Falls back to all-False if missing.
+        """
+        if "front_expiry" not in self.columns:
+            return pd.Series(False, index=self.index, name="is_rollover")
+        fe = self["front_expiry"]
+        return (fe.ne(fe.shift(1)) & fe.shift(1).notna()).rename("is_rollover")
+
+    @property
+    def continuous_prev_close(self) -> pd.Series:
+        """
+        Previous close adjusted for contract roll.
+
+        On rollover day t, the canonical 'previous close of the contract you
+        are now holding' is yesterday's BACK-month close — because today's
+        front IS yesterday's back. Using `close.shift(1)` (the OLD contract's
+        close) would conflate real market movement with the calendar spread.
+
+        Falls back to `close.shift(1)` when `back_close` is unavailable.
+        """
+        prev = self["close"].shift(1)
+        if "back_close" in self.columns and "front_expiry" in self.columns:
+            prev_back = self["back_close"].shift(1)
+            prev = prev.where(~self.is_rollover, prev_back)
+        return prev.rename("continuous_prev_close")
+
     # ── derived series ────────────────────────────────────────────────────────
+
+    # ── Intraday session helpers ──────────────────────────────────────────────
+
+    @property
+    def session(self) -> pd.Series:
+        """
+        TAIFEX trading-session label per bar based on time-of-day:
+            'day'   : 08:45 <= time <= 13:45
+            'night' : 15:00 <= time, or time < 05:05 (next morning)
+            'outside': anything else
+
+        For daily granularity (`time_granularity == '1d'`) every bar is 'day'.
+        """
+        if self.time_granularity == "1d":
+            return pd.Series("day", index=self.index, name="session")
+        tod = self.index.hour * 60 + self.index.minute
+        is_day   = (tod >= 8 * 60 + 45) & (tod <= 13 * 60 + 45)
+        is_night = (tod >= 15 * 60) | (tod < 5 * 60 + 5)
+        labels = np.where(is_day, "day", np.where(is_night, "night", "outside"))
+        return pd.Series(labels, index=self.index, name="session")
 
     @property
     def returns(self) -> pd.Series:
-        """Bar-to-bar percentage return of the close price."""
-        return self["close"].pct_change().rename("returns")
+        """
+        Contract-consistent bar-to-bar percentage return of the front-month
+        close. On daily-data rollover days this uses yesterday's back-month
+        close so the calendar spread does NOT contaminate the return.
+
+        For intraday data (`time_granularity != '1d'`), the return at the
+        first bar of every TAIFEX session (the gap from 13:45 day-close to
+        15:00 night-open, and from 05:00 night-close to next 08:45 day-open)
+        is set to NaN so the strategy P&L doesn't accidentally accrue
+        across the session gap.
+
+        Use `raw_returns` for the unadjusted `close.pct_change()`.
+        """
+        r = (self["close"] / self.continuous_prev_close - 1).rename("returns")
+        if self.time_granularity != "1d":
+            sess = self.session
+            break_mask = sess.ne(sess.shift(1)) & sess.shift(1).notna()
+            r = r.where(~break_mask, np.nan)
+        return r
+
+    @property
+    def raw_returns(self) -> pd.Series:
+        """
+        Naive close-to-close return = `close.pct_change()`.
+        On rollover days this includes the calendar-spread jump between the
+        old and new front contract. Prefer `returns` for backtesting.
+        """
+        return self["close"].pct_change().rename("raw_returns")
 
     @property
     def log_returns(self) -> pd.Series:

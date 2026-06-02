@@ -20,7 +20,10 @@ import pandas as pd
 
 from .asset import BaseAsset
 from . import operators as _ops
-from .simulate import _load_asset, _sharpe, normalize_signal
+from .simulate import (
+    _load_asset, _sharpe, normalize_signal,
+    _resolve_dates, _subset_asset, _slice_index,
+)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -162,8 +165,10 @@ def simulate_by_dollars(
     fee_rate:         float = 0.00002,
     spread_fraction:  float = 0.5,
     include_rollover: bool = True,
-    compare_amounts:  list | None = None,
-    compare_spreads:  list | None = None,
+    compare_amounts:  "list | None" = None,
+    compare_spreads:  "list | None" = None,
+    start_date=None,
+    end_date=None,
 ) -> dict:
     """
     Simulate the *actual dollar* P&L of `signal` on MTX (or any TAIFEX index future).
@@ -197,13 +202,13 @@ def simulate_by_dollars(
     """
     # ── Load asset & set context ────────────────────────────────────────────
     if isinstance(asset, BaseAsset):
-        asset_obj = asset
+        asset_obj_full = asset
     else:
-        asset_obj = _load_asset(asset, time_granularity, contract)
-    _ops.set_active_asset(asset_obj)
+        asset_obj_full = _load_asset(asset, time_granularity, contract)
+    _ops.set_active_asset(asset_obj_full)
 
-    # ── Normalize signal ────────────────────────────────────────────────────
-    sig = signal.reindex(asset_obj.index).astype(float)
+    # ── Normalize signal on FULL history (so rolling stats have warmup) ─────
+    sig = signal.reindex(asset_obj_full.index).astype(float)
     if normalize is True:
         signal_norm = normalize_signal(sig, method="tanh",
                                        window=norm_window, sensitivity=norm_sensitivity)
@@ -212,6 +217,18 @@ def simulate_by_dollars(
                                        window=norm_window, sensitivity=norm_sensitivity)
     else:
         signal_norm = sig
+
+    # ── Resolve & apply date range ──────────────────────────────────────────
+    start, end = _resolve_dates(start_date, end_date)
+    if start is not None or end is not None:
+        eval_idx = _slice_index(asset_obj_full.index, start, end)
+        if len(eval_idx) == 0:
+            raise ValueError(f"No data in range [{start}, {end}]")
+        asset_obj   = _subset_asset(asset_obj_full, eval_idx)
+        signal_norm = signal_norm.reindex(eval_idx)
+        _ops.set_active_asset(asset_obj)
+    else:
+        asset_obj = asset_obj_full
 
     # ── Main run + comparison sweeps ────────────────────────────────────────
     if compare_amounts is None:

@@ -1,5 +1,7 @@
 # data — large CSVs not tracked
 *_history.csv
+MXFR1k.csv
+history_data.zip
 
 # generated chart output
 mtx_chart.html

@@ -228,7 +228,68 @@ def available_assets() -> list[str]:
     )
 
 
+_INTRADAY_GRANULARITIES = {"1m", "5m", "15m", "30m", "1h"}
+
+
+def _resample_rule(granularity: str) -> str:
+    # Lowercase 'h' / 'min' required by recent pandas.
+    return {"1m": "1min", "5m": "5min", "15m": "15min", "30m": "30min", "1h": "1h"}[granularity]
+
+
+def _load_intraday(asset: str, time_granularity: str) -> BaseAsset:
+    """
+    Load 1-minute (or coarser) bars for MXF/MTX from `MXFR1k.csv`.
+
+    The file is a 1-minute continuous-front MXF series with columns
+        ts, Open, High, Low, Close, Volume, Amount
+    spanning ~2023-03 to present, both day session (08:45-13:45) and
+    night session (15:00-05:00 next morning).
+
+    Coarser granularities (5m / 15m / 30m / 1h) resample from 1m via
+    standard OHLCV aggregation; the resampler respects the 13:45 → 15:00
+    gap because there are no rows in that interval (so empty buckets
+    appear and we drop them via `dropna`).
+    """
+    from pathlib import Path
+
+    code = asset.upper()
+    if code not in {"MTX", "MXF"}:
+        raise NotImplementedError(
+            f"Intraday data for {code!r} not available — only MXF/MTX is supported "
+            "(file: MXFR1k.csv)."
+        )
+
+    path = Path(__file__).parent.parent / "MXFR1k.csv"
+    if not path.exists():
+        raise FileNotFoundError(f"Intraday CSV not found: {path}")
+
+    df = pd.read_csv(
+        path,
+        parse_dates=["ts"],
+        dtype={"Open": "float32", "High": "float32", "Low": "float32",
+               "Close": "float32", "Volume": "int32", "Amount": "float64"},
+    ).set_index("ts").sort_index()
+    df.columns = df.columns.str.lower()
+    df = df[["open", "high", "low", "close", "volume"]]
+
+    # The CSV has ~20k duplicate timestamps clustered around contract rollovers
+    # (same minute observed on both OLD and NEW contract). Keep the LAST entry
+    # so the series rolls cleanly forward onto the new contract.
+    df = df[~df.index.duplicated(keep="last")]
+
+    if time_granularity != "1m":
+        rule = _resample_rule(time_granularity)
+        df = (df.resample(rule)
+                .agg({"open": "first", "high": "max", "low": "min",
+                      "close": "last", "volume": "sum"})
+                .dropna(subset=["close"]))
+
+    return BaseAsset.from_df(df, symbol=code, time_granularity=time_granularity)
+
+
 def _load_asset(asset: str, time_granularity: str, contract: str = "front") -> BaseAsset:
+    if time_granularity in _INTRADAY_GRANULARITIES:
+        return _load_intraday(asset, time_granularity)
     if time_granularity != "1d":
         raise NotImplementedError(f"Granularity '{time_granularity}' is not yet supported.")
 
@@ -278,13 +339,22 @@ def _load_asset(asset: str, time_granularity: str, contract: str = "front") -> B
     for col in ["open", "high", "low", "close", "volume", "settlement", "oi", "bid", "ask"]:
         df[col] = pd.to_numeric(df[col].replace("-", np.nan), errors="coerce")
 
-    # ── Day session (一般) — select front/back contract per date ─────────────
+    # ── Day session (一般) — rank contracts by expiry per date ──────────────
     day = df[df["session"] == "一般"].copy()
     day["expiry_int"] = pd.to_numeric(day["expiry"], errors="coerce")
     day = day.sort_values(["date", "expiry_int"])
     day["_rank"] = day.groupby("date").cumcount()
-    rank = 0 if contract == "front" else 1
-    selected = day[day["_rank"] == rank].drop(columns=["expiry_int", "_rank", "session"])
+    front_rank = 0 if contract == "front" else 1
+
+    selected = day[day["_rank"] == front_rank].drop(columns=["expiry_int", "_rank", "session"])
+
+    # ── Back-month (next-rank) close — needed for rollover-adjusted returns ──
+    back_rank = front_rank + 1
+    back = day[day["_rank"] == back_rank][["date", "expiry", "close"]].rename(columns={
+        "expiry": "back_expiry",
+        "close":  "back_close",
+    })
+    selected = selected.merge(back, on="date", how="left")
 
     # ── Night session (盤後) — match to the same (date, expiry) ─────────────
     night_cols = ["date", "expiry", "open", "high", "low", "close", "volume"]
@@ -295,9 +365,12 @@ def _load_asset(asset: str, time_granularity: str, contract: str = "front") -> B
         "close":  "night_close",
         "volume": "night_volume",
     })
-    merged = selected.merge(night, on=["date", "expiry"], how="left")
+    selected = selected.merge(night, on=["date", "expiry"], how="left")
 
-    series = merged.set_index("date").sort_index()
+    # Rename the merge-key "expiry" column to the more explicit "front_expiry".
+    selected = selected.rename(columns={"expiry": "front_expiry"})
+
+    series = selected.set_index("date").sort_index()
     series = series.dropna(subset=["open", "high", "low", "close"])
 
     symbol = code if contract == "front" else f"{code}_back"
@@ -308,7 +381,22 @@ def _load_asset(asset: str, time_granularity: str, contract: str = "front") -> B
 # Metrics
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _sharpe(pnl: pd.Series, periods: int = 252) -> float:
+def _active_periods_per_year(default: int = 252) -> int:
+    """Look up periods/year from the active asset (intraday-aware)."""
+    a = _ops._active_asset
+    if a is None:
+        return default
+    return int(getattr(a, "periods_per_year", default))
+
+
+def _sharpe(pnl: pd.Series, periods: "int | None" = None) -> float:
+    """
+    Annualised Sharpe. `periods` defaults to the active asset's
+    `periods_per_year` so intraday Sharpe is annualised correctly
+    (e.g. 252×1140 for 1-minute MXF data).
+    """
+    if periods is None:
+        periods = _active_periods_per_year()
     r = pnl.replace([np.inf, -np.inf], np.nan).dropna()
     if r.empty or r.std(ddof=0) == 0:
         return np.nan
@@ -319,17 +407,19 @@ def _sharpe(pnl: pd.Series, periods: int = 252) -> float:
 # Main entry point
 # ─────────────────────────────────────────────────────────────────────────────
 
-def simulate(
+def Simulate(
     sig: pd.Series,
     time_granularity: str = "1d",
     asset: str = "mtx",
     contract: str = "front",
-    normalize: bool | str = True,
+    normalize: "bool | str" = True,
     norm_window: int = 252,
     norm_sensitivity: float = 1.0,
     point_value: float = 50.0,
     fixed_per_side: float = 20.0,
     fee_rate: float = 0.00002,
+    start_date=None,
+    end_date=None,
 ) -> dict:
     """
     Backtest a signal and plot a multi-panel diagnostic dashboard.
@@ -347,19 +437,24 @@ def simulate(
     point_value      : TWD per index point per contract (MTX = 50).
     fixed_per_side   : fixed commission in TWD per side per contract (default 20).
     fee_rate         : futures transaction tax per side as fraction of notional (default 0.00002).
+    start_date,
+    end_date         : restrict the evaluation window. If None, fall back to
+                       whatever ``cta.set_date_range`` set. Signal normalisation
+                       is still computed on the FULL history (so rolling stats
+                       have a proper warmup), only the displayed P&L is sliced.
 
     Returns
     -------
     dict with keys: asset_obj, signal, exec_sig, pnl, cum_pnl, tcost, pnl_net, cum_pnl_net
     """
-    # ── 1. Load & set context ─────────────────────────────────────────────────
-    asset_obj = _load_asset(asset, time_granularity, contract)
-    _ops.set_active_asset(asset_obj)
+    # ── 1. Load full asset & set context ────────────────────────────────────
+    asset_obj_full = _load_asset(asset, time_granularity, contract)
+    _ops.set_active_asset(asset_obj_full)
 
-    # ── 2. Align ─────────────────────────────────────────────────────────────
-    sig = sig.reindex(asset_obj.index).astype(float)
+    # ── 2. Align signal to full asset index ─────────────────────────────────
+    sig = sig.reindex(asset_obj_full.index).astype(float)
 
-    # ── 3. Normalize ──────────────────────────────────────────────────────────
+    # ── 3. Normalize on FULL history (gives rolling stats a real warmup) ────
     if normalize is True:
         signal = normalize_signal(sig, method="tanh", window=norm_window, sensitivity=norm_sensitivity)
     elif isinstance(normalize, str):
@@ -367,29 +462,50 @@ def simulate(
     else:
         signal = sig
 
-    # ── 4. P&L:  lag(2, signal) * returns ────────────────────────────────────
-    exec_sig = signal.shift(2)                  # 2-bar execution lag
-    ret      = asset_obj.returns                # close.pct_change()
-    pnl      = (exec_sig * ret).rename("pnl")
-    cum_pnl  = pnl.fillna(0).cumsum().rename("cum_pnl")  # NaN → 0 contrib (continuous)
+    # ── 4. P&L:  lag(2, signal) * returns  (on full history) ────────────────
+    exec_sig = signal.shift(2)
+    ret      = asset_obj_full.returns
+    pnl_full = (exec_sig * ret).rename("pnl")
 
-    # ── 5. Transaction cost ───────────────────────────────────────────────────
-    # cost per side (as fraction of contract value) = fixed_TWD/(close×point_value) + fee_rate
-    # total daily cost = turnover × cost_per_side × 2 sides
-    # NaN exec_sig (e.g. filtered-out days) → 0 exposure, so transitioning in/out counts as a real trade.
-    turnover   = exec_sig.fillna(0).diff().abs()
-    cost_pct   = fixed_per_side / (asset_obj.close * point_value) + fee_rate
-    tcost      = (turnover * cost_pct * 2).rename("tcost")
-    pnl_net    = (pnl - tcost).rename("pnl_net")
+    # ── 5. Transaction cost (on full history) ───────────────────────────────
+    turnover    = exec_sig.fillna(0).diff().abs()
+    cost_pct    = fixed_per_side / (asset_obj_full.close * point_value) + fee_rate
+    tcost_full  = (turnover * cost_pct * 2).rename("tcost")
+    pnl_net_full = (pnl_full - tcost_full).rename("pnl_net")
+
+    # ── 6. Load 次月 for comparison ─────────────────────────────────────────
+    try:
+        asset_obj_back_full = _load_asset(asset, time_granularity, "back")
+    except Exception:
+        asset_obj_back_full = None
+
+    # ── 7. Resolve & apply date range  (signal/PnL already on full data) ────
+    start, end = _resolve_dates(start_date, end_date)
+    if start is not None or end is not None:
+        eval_idx = _slice_index(asset_obj_full.index, start, end)
+        if len(eval_idx) == 0:
+            raise ValueError(f"No data in range [{start}, {end}]")
+        asset_obj      = _subset_asset(asset_obj_full, eval_idx)
+        asset_obj_back = (_subset_asset(asset_obj_back_full, eval_idx)
+                          if asset_obj_back_full is not None else None)
+        _ops.set_active_asset(asset_obj)
+        signal   = signal.reindex(eval_idx)
+        exec_sig = exec_sig.reindex(eval_idx)
+        pnl      = pnl_full.reindex(eval_idx)
+        tcost    = tcost_full.reindex(eval_idx)
+        pnl_net  = pnl_net_full.reindex(eval_idx)
+    else:
+        asset_obj      = asset_obj_full
+        asset_obj_back = asset_obj_back_full
+        pnl     = pnl_full
+        tcost   = tcost_full
+        pnl_net = pnl_net_full
+
+    # Recompute cumulatives so they start at 0 within the eval window
+    cum_pnl     = pnl.fillna(0).cumsum().rename("cum_pnl")
     cum_pnl_net = pnl_net.fillna(0).cumsum().rename("cum_pnl_net")
 
-    # ── 6. Load 次月 for comparison ───────────────────────────────────────────
-    try:
-        asset_obj_back = _load_asset(asset, time_granularity, "back")
-    except Exception:
-        asset_obj_back = None
-
-    # ── 7. Plot ───────────────────────────────────────────────────────────────
+    # ── 8. Plot ─────────────────────────────────────────────────────────────
     _plot(
         asset_obj=asset_obj, asset_obj_back=asset_obj_back,
         signal=signal, exec_sig=exec_sig,
@@ -408,6 +524,10 @@ def simulate(
         "pnl_net":        pnl_net,
         "cum_pnl_net":    cum_pnl_net,
     }
+
+
+# Backward-compatible alias — older notebooks call cta.simulate(...).
+simulate = Simulate
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -833,20 +953,25 @@ def _plot_session_breakdown(ax, asset_obj, exec_sig: pd.Series) -> None:
     """
     (4,1) Cumulative signal PnL decomposed into four intraday windows.
 
-        ret[t] = close[t] / close[t-1] - 1   (the bar's close-to-close return)
+        ret[t] = close[t] / close[t-1] - 1     (close-to-close)
               ≈ mid[t] + night[t] + over[t] + day[t]
 
-    where:
-        mid[t]   = night_open[t-1] / close[t-1]      - 1   (gap into 夜盤)
-        night[t] = night_close[t-1] / night_open[t-1] - 1   (夜盤 session)
-        over[t]  = open[t] / night_close[t-1]        - 1   (gap into next 日盤)
-        day[t]   = close[t] / open[t]                - 1   (日盤 session)
+    TAIFEX labeling convention: ``盤後[X]`` is the night session that
+    ENDED on day X (started 15:00 of X−1, ended ~05:00 of X). So at index t:
+
+        mid[t]   = night_open[t]  / close[t-1]     - 1   (close[t-1] @ 13:45 → 15:00 of t-1)
+        night[t] = night_close[t] / night_open[t]  - 1   (15:00 of t-1 → 05:00 of t)
+        over[t]  = open[t]        / night_close[t] - 1   (05:00 → 08:45 of t)
+        day[t]   = close[t]       / open[t]        - 1   (08:45 → 13:45 of t)
 
     Pre-2017 (no 夜盤 data) `mid` and `night` are 0 and `over` falls back
     to `open[t] / close[t-1] - 1` so the four components still sum to ret.
     """
     close = asset_obj.close
     open_ = asset_obj.open
+    # Use the rollover-aware previous close so the mid/over components don't
+    # pick up the calendar-spread jump on rollover days.
+    prev_close = asset_obj.continuous_prev_close
 
     has_night = ("night_open" in asset_obj.columns and "night_close" in asset_obj.columns
                  and asset_obj["night_open"].notna().any())
@@ -854,15 +979,15 @@ def _plot_session_breakdown(ax, asset_obj, exec_sig: pd.Series) -> None:
     if has_night:
         no  = asset_obj.night_open
         nc  = asset_obj.night_close
-        mid_ret   = (no.shift(1) / close.shift(1) - 1).fillna(0)
-        night_ret = (nc.shift(1) / no.shift(1)    - 1).fillna(0)
+        mid_ret   = (no / prev_close - 1).fillna(0)
+        night_ret = (nc / no          - 1).fillna(0)
         # Use night_close where available, fall back to prev day's close for pre-夜盤 era
-        over_base = nc.shift(1).fillna(close.shift(1))
+        over_base = nc.fillna(prev_close)
         over_ret  = (open_ / over_base - 1).fillna(0)
     else:
         mid_ret   = pd.Series(0.0, index=close.index)
         night_ret = pd.Series(0.0, index=close.index)
-        over_ret  = (open_ / close.shift(1) - 1).fillna(0)
+        over_ret  = (open_ / prev_close - 1).fillna(0)
 
     day_ret = (close / open_ - 1).fillna(0)
 
@@ -921,13 +1046,15 @@ def _plot_cost_summary(ax, pnl, cum_pnl, pnl_net, cum_pnl_net, tcost) -> None:
 
 def SimulateAll(
     *sigs: pd.Series,
-    names: list[str] | None = None,
+    names: "list[str] | None" = None,
     time_granularity: str = "1d",
     asset: str = "mtx",
     contract: str = "front",
-    normalize: bool | str = True,
+    normalize: "bool | str" = True,
     norm_window: int = 252,
     norm_sensitivity: float = 1.0,
+    start_date=None,
+    end_date=None,
 ) -> None:
     """
     Compare multiple signals side-by-side in a compact grid.
@@ -943,17 +1070,29 @@ def SimulateAll(
     time_granularity : bar size passed to the asset loader
     asset            : which asset to load ('mtx')
     contract         : 'front' (近月, default) or 'back' (次月)
-    normalize        : same as simulate() — True / 'rank' / False
+    normalize        : same as Simulate() — True / 'rank' / False
     norm_window      : normalization look-back window
     norm_sensitivity : tanh saturation speed
+    start_date,
+    end_date         : restrict the evaluation window. If None, fall back to
+                       whatever ``cta.set_date_range`` set.
     """
     if not sigs:
         raise ValueError("Provide at least one signal.")
 
-    # ── load asset once and set context ──────────────────────────────────────
-    asset_obj = _load_asset(asset, time_granularity, contract)
-    _ops.set_active_asset(asset_obj)
-    ret = asset_obj.returns
+    # ── load asset once on FULL history and set context ─────────────────────
+    asset_obj_full = _load_asset(asset, time_granularity, contract)
+    _ops.set_active_asset(asset_obj_full)
+    ret_full = asset_obj_full.returns
+
+    # Resolve & apply date range (signal normalisation still uses full history)
+    start, end = _resolve_dates(start_date, end_date)
+    if start is not None or end is not None:
+        eval_idx = _slice_index(asset_obj_full.index, start, end)
+        if len(eval_idx) == 0:
+            raise ValueError(f"No data in range [{start}, {end}]")
+    else:
+        eval_idx = asset_obj_full.index
 
     n      = len(sigs)
     n_rows = math.ceil(n / 2)           # 2 signals per row, 4 cols total
@@ -974,8 +1113,8 @@ def SimulateAll(
 
         name = names[i] if (names and i < len(names)) else f"Signal {i + 1}"
 
-        # normalize
-        sig = sig.reindex(asset_obj.index).astype(float)
+        # normalize on FULL history (so rolling stats have proper warmup)
+        sig = sig.reindex(asset_obj_full.index).astype(float)
         if normalize is True:
             signal = normalize_signal(sig, method="tanh", window=norm_window, sensitivity=norm_sensitivity)
         elif isinstance(normalize, str):
@@ -983,9 +1122,12 @@ def SimulateAll(
         else:
             signal = sig
 
-        exec_sig = signal.shift(2)
-        pnl      = (exec_sig * ret).rename("pnl")
-        cum_pnl  = pnl.fillna(0).cumsum()   # NaN days contribute 0 → continuous line
+        exec_sig_full = signal.shift(2)
+        pnl_full      = (exec_sig_full * ret_full).rename("pnl")
+        # Slice to eval window, then restart the cumulative sum at 0
+        exec_sig = exec_sig_full.reindex(eval_idx)
+        pnl      = pnl_full.reindex(eval_idx)
+        cum_pnl  = pnl.fillna(0).cumsum()
         turnover = exec_sig.fillna(0).diff().abs().rolling(20, min_periods=1).mean()
 
         # ── left: cumulative PnL ─────────────────────────────────────────────
