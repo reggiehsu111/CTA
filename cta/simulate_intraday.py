@@ -320,4 +320,139 @@ def _plot_cost(ax, tcost):
     ax.legend(fontsize=_FSS, loc="upper left"); ax.grid(True, alpha=0.3)
 
 
-__all__ = ["SimulateIntraday"]
+# ─────────────────────────────────────────────────────────────────────────────
+# Multi-signal comparison — same role as `SimulateAll` but cheap at intraday scale
+# ─────────────────────────────────────────────────────────────────────────────
+
+def SimulateAllIntraday(
+    *sigs: pd.Series,
+    names: "list[str] | None" = None,
+    time_granularity: str = "1m",
+    asset: str = "mtx",
+    normalize: "bool | str" = False,
+    norm_window: int = 252,
+    norm_sensitivity: float = 1.0,
+    point_value:     float = 50.0,
+    fixed_per_side:  float = 20.0,
+    fee_rate:        float = 0.00002,
+    start_date=None,
+    end_date=None,
+) -> None:
+    """
+    Compare multiple intraday signals side-by-side, like `SimulateAll` but
+    designed for high bar counts.
+
+    Each signal occupies two columns:
+      Left  — gross + net cumulative PnL line (cheap to render)
+      Right — *daily-aggregated* PnL bars (~hundreds of bars, not the millions
+              you'd get from per-bar bars at 1m)
+
+    All Sharpes are annualised with the active asset's `periods_per_year`,
+    so 1m and 1d strategies are directly comparable.
+    """
+    import math
+    if not sigs:
+        raise ValueError("Provide at least one signal.")
+
+    # ── load asset on FULL history & set context ────────────────────────────
+    asset_obj_full = _load_asset(asset, time_granularity)
+    _ops.set_active_asset(asset_obj_full)
+    ret_full = asset_obj_full.returns
+
+    start, end = _resolve_dates(start_date, end_date)
+    if start is not None or end is not None:
+        eval_idx = _slice_index(asset_obj_full.index, start, end)
+        if len(eval_idx) == 0:
+            raise ValueError(f"No data in range [{start}, {end}]")
+    else:
+        eval_idx = asset_obj_full.index
+
+    n      = len(sigs)
+    n_rows = math.ceil(n / 2)
+    fig, axs = plt.subplots(
+        n_rows, 4, figsize=(24, 4.5 * n_rows), constrained_layout=True,
+    )
+    if n_rows == 1:
+        axs = axs[np.newaxis, :]
+
+    sess_full  = asset_obj_full.session
+    close_full = asset_obj_full.close
+    cost_pct_full = fixed_per_side / (close_full * point_value) + fee_rate
+
+    for i, sig in enumerate(sigs):
+        row      = i // 2
+        col_base = (i % 2) * 2
+        ax_pnl   = axs[row, col_base]
+        ax_d     = axs[row, col_base + 1]
+        name     = names[i] if (names and i < len(names)) else f"Signal {i + 1}"
+
+        sig_aligned = sig.reindex(asset_obj_full.index).astype(float)
+        if normalize is True:
+            signal = normalize_signal(sig_aligned, method="tanh",
+                                      window=norm_window, sensitivity=norm_sensitivity)
+        elif isinstance(normalize, str):
+            signal = normalize_signal(sig_aligned, method=normalize,
+                                      window=norm_window, sensitivity=norm_sensitivity)
+        else:
+            signal = sig_aligned
+
+        exec_sig_full = signal.shift(2)
+        pnl_full      = exec_sig_full * ret_full
+
+        turnover_full = exec_sig_full.fillna(0).diff().abs()
+        tcost_full    = turnover_full * cost_pct_full * 2
+        pnl_net_full  = pnl_full - tcost_full
+
+        # Slice to eval window
+        pnl      = pnl_full.reindex(eval_idx)
+        pnl_net  = pnl_net_full.reindex(eval_idx)
+        exec_sig = exec_sig_full.reindex(eval_idx)
+        sess     = sess_full.reindex(eval_idx)
+
+        cum_pnl     = pnl.fillna(0).cumsum() * 100        # %
+        cum_pnl_net = pnl_net.fillna(0).cumsum() * 100
+
+        sr_g = _sharpe(pnl)
+        sr_n = _sharpe(pnl_net)
+        sr_d = _sharpe(pnl.where(sess == "day"))
+        sr_nt = _sharpe(pnl.where(sess == "night"))
+
+        # ── Left: cumulative gross + net PnL ────────────────────────────────
+        ax_pnl.plot(cum_pnl.index,     cum_pnl.values,     color="#1565c0", linewidth=1.0,
+                    label=f"gross  (SR {sr_g:+.2f})")
+        ax_pnl.plot(cum_pnl_net.index, cum_pnl_net.values, color="#c62828", linewidth=1.0,
+                    label=f"net    (SR {sr_n:+.2f})")
+        ax_pnl.axhline(0, color="black", linewidth=0.5, linestyle="--", alpha=0.5)
+        ax_pnl.set_title(
+            f"{name}  —  Cum PnL  (day {sr_d:+.2f}  /  night {sr_nt:+.2f})",
+            fontsize=12,
+        )
+        ax_pnl.set_ylabel("Cum return (%)")
+        ax_pnl.legend(fontsize=9, loc="upper left")
+        ax_pnl.grid(True, alpha=0.3)
+
+        # ── Right: daily-aggregated PnL bars ────────────────────────────────
+        # Aggregate to ~one bar per calendar day to avoid plotting all minutes
+        daily_gross = pnl.fillna(0).groupby(pnl.index.date).sum() * 100   # %
+        bar_colors  = ["#00897b" if v >= 0 else "#c62828" for v in daily_gross.values]
+        ax_d.bar(pd.to_datetime(daily_gross.index), daily_gross.values,
+                 color=bar_colors, alpha=0.85, width=0.9)
+        ax_d.axhline(0, color="black", linewidth=0.5, linestyle="--", alpha=0.5)
+        ax_d.set_title(
+            f"{name}  —  Daily-aggregated gross PnL  "
+            f"(σ {daily_gross.std():.3f}%/d,  N={len(daily_gross)})",
+            fontsize=12,
+        )
+        ax_d.set_ylabel("Daily PnL (%)")
+        ax_d.grid(True, alpha=0.3, axis="y")
+
+    # hide unused axes
+    for j in range(n, n_rows * 2):
+        r, c = j // 2, (j % 2) * 2
+        axs[r, c].axis("off")
+        axs[r, c + 1].axis("off")
+
+    plt.show()
+
+
+__all__ = ["SimulateIntraday", "SimulateAllIntraday"]
