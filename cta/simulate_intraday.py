@@ -40,6 +40,7 @@ def SimulateIntraday(
     fixed_per_side: float = 20.0,
     fee_rate: float = 0.00002,
     target_vol: float = 0.15,
+    exec_lag: int = 2,
     start_date=None,
     end_date=None,
 ) -> dict:
@@ -49,6 +50,16 @@ def SimulateIntraday(
     Default `normalize=False` because intraday signals (z-scores, binary
     cross-overs, etc.) are usually already in [-1, 1]; flip to True if
     you're passing a raw factor.
+
+    `exec_lag` controls the position-to-return alignment:
+      *  +2 (default)  — signal at t is acted on for the bar [t+1, t+2]
+                          → no look-ahead, the realistic backtest.
+      *   0             — same-bar (assume zero latency execution).
+      *  -1             — **lead-1 ORACLE test**: position at t uses the
+                          signal from bar t+1. This is look-ahead bias
+                          on purpose, so use only as a sanity check —
+                          if even the oracle can't make money, the
+                          signal carries no information.
 
     Subplot layout (3 × 3):
         (0,0) Cum PnL gross + net   (0,1) Signal vs B&H  (0,2) Vol-matched
@@ -72,8 +83,8 @@ def SimulateIntraday(
     else:
         signal = sig
 
-    # ── 4. P&L on full data with 2-bar exec lag ────────────────────────────
-    exec_sig_full = signal.shift(2)
+    # ── 4. P&L on full data with chosen exec lag (default 2 = realistic) ───
+    exec_sig_full = signal.shift(exec_lag)
     ret_full      = asset_obj_full.returns
     pnl_full      = (exec_sig_full * ret_full).rename("pnl")
 
@@ -337,6 +348,7 @@ def SimulateAllIntraday(
     point_value:     float = 50.0,
     fixed_per_side:  float = 20.0,
     fee_rate:        float = 0.00002,
+    exec_lag:        int = 2,
     start_date=None,
     end_date=None,
 ) -> None:
@@ -351,6 +363,9 @@ def SimulateAllIntraday(
 
     All Sharpes are annualised with the active asset's `periods_per_year`,
     so 1m and 1d strategies are directly comparable.
+
+    `exec_lag` controls signal-to-return alignment (see `SimulateIntraday`
+    docstring). Set to -1 for the look-ahead oracle test.
     """
     import math
     if not sigs:
@@ -398,7 +413,7 @@ def SimulateAllIntraday(
         else:
             signal = sig_aligned
 
-        exec_sig_full = signal.shift(2)
+        exec_sig_full = signal.shift(exec_lag)
         pnl_full      = exec_sig_full * ret_full
 
         turnover_full = exec_sig_full.fillna(0).diff().abs()
@@ -425,9 +440,11 @@ def SimulateAllIntraday(
         ax_pnl.plot(cum_pnl_net.index, cum_pnl_net.values, color="#c62828", linewidth=1.0,
                     label=f"net    (SR {sr_n:+.2f})")
         ax_pnl.axhline(0, color="black", linewidth=0.5, linestyle="--", alpha=0.5)
+        lag_tag = ("lag" if exec_lag > 0 else "lead" if exec_lag < 0 else "same-bar")
         ax_pnl.set_title(
-            f"{name}  —  Cum PnL  (day {sr_d:+.2f}  /  night {sr_nt:+.2f})",
-            fontsize=12,
+            f"{name}  —  Cum PnL  [{lag_tag} {abs(exec_lag) if exec_lag != 0 else ''}]  "
+            f"(day {sr_d:+.2f}  /  night {sr_nt:+.2f})",
+            fontsize=11,
         )
         ax_pnl.set_ylabel("Cum return (%)")
         ax_pnl.legend(fontsize=9, loc="upper left")
