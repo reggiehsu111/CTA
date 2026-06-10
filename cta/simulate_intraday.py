@@ -78,9 +78,11 @@ def SimulateIntraday(
     pnl_full      = (exec_sig_full * ret_full).rename("pnl")
 
     # ── 5. Transaction cost (turnover-based) ───────────────────────────────
+    # turnover = |Δexec_sig| is the per-bar trade count; cost_pct is per-side.
+    # The product is total cost — no extra ×2 (which would double-count).
     turnover    = exec_sig_full.fillna(0).diff().abs()
     cost_pct    = fixed_per_side / (asset_obj_full.close * point_value) + fee_rate
-    tcost_full  = (turnover * cost_pct * 2).rename("tcost")
+    tcost_full  = (turnover * cost_pct).rename("tcost")
     pnl_net_full = (pnl_full - tcost_full).rename("pnl_net")
 
     # ── 6. Resolve & apply date range ──────────────────────────────────────
@@ -400,7 +402,7 @@ def SimulateAllIntraday(
         pnl_full      = exec_sig_full * ret_full
 
         turnover_full = exec_sig_full.fillna(0).diff().abs()
-        tcost_full    = turnover_full * cost_pct_full * 2
+        tcost_full    = turnover_full * cost_pct_full          # no ×2
         pnl_net_full  = pnl_full - tcost_full
 
         # Slice to eval window

@@ -468,9 +468,12 @@ def Simulate(
     pnl_full = (exec_sig * ret).rename("pnl")
 
     # ── 5. Transaction cost (on full history) ───────────────────────────────
+    # turnover = |Δexec_sig| is already the count of trades (one side each),
+    # so multiplying by cost_pct (per-side cost) gives the correct total —
+    # NO extra factor of 2.
     turnover    = exec_sig.fillna(0).diff().abs()
     cost_pct    = fixed_per_side / (asset_obj_full.close * point_value) + fee_rate
-    tcost_full  = (turnover * cost_pct * 2).rename("tcost")
+    tcost_full  = (turnover * cost_pct).rename("tcost")
     pnl_net_full = (pnl_full - tcost_full).rename("pnl_net")
 
     # ── 6. Load 次月 for comparison ─────────────────────────────────────────
