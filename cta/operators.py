@@ -217,6 +217,20 @@ def InstSum(n: int, s: pd.Series, min_periods: int | None = None) -> pd.Series:
     return s.rolling(n, min_periods=mp).sum()
 
 
+def InstCorr(n: int, s1: pd.Series, s2: pd.Series,
+              min_periods: int | None = None) -> pd.Series:
+    """
+    Rolling Pearson correlation between two series over the last n bars.
+
+    Useful as a cross-feature signal — e.g. correlation of `volume` with
+    past close-to-close returns measures whether large bars are bought up
+    (positive ρ) or sold into (negative ρ).
+    """
+    mp = min_periods if min_periods is not None else max(3, n // 2)
+    s1, s2 = s1.align(s2, join="inner")
+    return s1.rolling(n, min_periods=mp).corr(s2)
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Rolling rank / z-score
 # ─────────────────────────────────────────────────────────────────────────────
@@ -515,7 +529,7 @@ __all__ = [
     "Lag", "Lead",
     "Filter",
     "ForwardFill",
-    "InstMean", "InstStdev", "InstSkew", "InstSum",
+    "InstMean", "InstStdev", "InstSkew", "InstSum", "InstCorr",
     "InstRank", "InstZScore",
     "Diff", "PctChange",
     "Event", "Caar",
