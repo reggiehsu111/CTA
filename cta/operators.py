@@ -217,18 +217,79 @@ def InstSum(n: int, s: pd.Series, min_periods: int | None = None) -> pd.Series:
     return s.rolling(n, min_periods=mp).sum()
 
 
-def InstCorr(n: int, s1: pd.Series, s2: pd.Series,
-              min_periods: int | None = None) -> pd.Series:
+def InstCorr(
+    n: int,
+    s1: pd.Series,
+    s2: pd.Series,
+    method: str = "pearson",
+    min_periods: int | None = None,
+) -> pd.Series:
     """
-    Rolling Pearson correlation between two series over the last n bars.
+    Rolling correlation between two series over the last n bars.
 
     Useful as a cross-feature signal — e.g. correlation of `volume` with
     past close-to-close returns measures whether large bars are bought up
     (positive ρ) or sold into (negative ρ).
+
+    Parameters
+    ----------
+    n           : window length in bars.
+    s1, s2      : two date-indexed pandas Series. Auto-aligned to their
+                  intersection.
+    method      : 'pearson' (default, linear)  — fast, uses pandas rolling.corr.
+                  'spearman' (rank-based)     — robust to outliers and monotone
+                                                  non-linearity. Vectorised with
+                                                  `sliding_window_view`, chunked
+                                                  to keep peak memory bounded.
+    min_periods : minimum window size for a non-NaN result. Default n // 2.
+
+    Notes
+    -----
+    The Spearman implementation uses within-window ranks. NaN values are
+    placed at the highest ranks by `argsort`; pre-clean inputs if that's
+    a concern.
     """
+    if method not in ("pearson", "spearman"):
+        raise ValueError(f"method must be 'pearson' or 'spearman', got {method!r}")
+
     mp = min_periods if min_periods is not None else max(3, n // 2)
     s1, s2 = s1.align(s2, join="inner")
-    return s1.rolling(n, min_periods=mp).corr(s2)
+
+    if method == "pearson":
+        return s1.rolling(n, min_periods=mp).corr(s2).rename(f"corr_{n}")
+
+    # ── Spearman: within-window ranks → Pearson on ranks ─────────────────
+    from numpy.lib.stride_tricks import sliding_window_view
+
+    arr1 = s1.values.astype(np.float64)
+    arr2 = s2.values.astype(np.float64)
+    N    = len(arr1)
+    out  = np.full(N, np.nan, dtype=np.float64)
+
+    if N < n:
+        return pd.Series(out, index=s1.index, name=f"corr_{n}")
+
+    CHUNK = 100_000
+    for out_start in range(n - 1, N, CHUNK):
+        out_end   = min(out_start + CHUNK, N)
+        inp_start = out_start - n + 1
+        a1 = arr1[inp_start:out_end]
+        a2 = arr2[inp_start:out_end]
+
+        w1 = sliding_window_view(a1, n)
+        w2 = sliding_window_view(a2, n)
+
+        # Within-window ranks; .astype(float32) halves the memory footprint
+        r1 = np.argsort(np.argsort(w1, axis=1), axis=1).astype(np.float32)
+        r2 = np.argsort(np.argsort(w2, axis=1), axis=1).astype(np.float32)
+
+        m1 = r1.mean(axis=1, keepdims=True)
+        m2 = r2.mean(axis=1, keepdims=True)
+        num = ((r1 - m1) * (r2 - m2)).sum(axis=1)
+        den = np.sqrt(((r1 - m1) ** 2).sum(axis=1) * ((r2 - m2) ** 2).sum(axis=1))
+        out[out_start:out_end] = np.where(den > 0, num / den, np.nan)
+
+    return pd.Series(out, index=s1.index, name=f"corr_{n}")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
