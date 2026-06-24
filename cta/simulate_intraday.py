@@ -474,4 +474,202 @@ def SimulateAllIntraday(
     plt.show()
 
 
-__all__ = ["SimulateIntraday", "SimulateAllIntraday"]
+# ─────────────────────────────────────────────────────────────────────────────
+# Calendar / seasonality dashboard — weekday, month, CASR around expiry
+# ─────────────────────────────────────────────────────────────────────────────
+
+def SimulateIntradayCalendar(
+    sig: pd.Series,
+    time_granularity: str = "1m",
+    asset: str = "mtx",
+    normalize: "bool | str" = False,
+    norm_window: int = 252,
+    norm_sensitivity: float = 1.0,
+    point_value: float = 50.0,
+    fixed_per_side: float = 20.0,
+    fee_rate: float = 0.00002,
+    exec_lag: int = 2,
+    expiry_window: int = 10,
+    start_date=None,
+    end_date=None,
+) -> dict:
+    """
+    Seasonality dashboard for an intraday signal — answers "when do the
+    returns come in?"
+
+    Three panels (1 × 3):
+      (0) Avg daily PnL by weekday   — Mon … Fri
+      (1) Avg daily PnL by month     — Jan … Dec
+      (2) CASR ±`expiry_window` days around TAIFEX monthly expiry
+          (third Wednesday) — signal CASR (blue) vs buy-and-hold CAR (grey)
+
+    The signal's per-bar PnL is aggregated to per-calendar-day and the
+    calendar plots run on the daily series. CASR is also computed on the
+    daily-aggregated series so the result is comparable to `Simulate`'s
+    daily expiry plot.
+
+    All other arguments follow `SimulateIntraday` exactly.
+    """
+    asset_obj_full = _load_asset(asset, time_granularity)
+    _ops.set_active_asset(asset_obj_full)
+
+    sig = sig.reindex(asset_obj_full.index).astype(float)
+
+    if normalize is True:
+        signal = normalize_signal(sig, method="tanh",
+                                  window=norm_window, sensitivity=norm_sensitivity)
+    elif isinstance(normalize, str):
+        signal = normalize_signal(sig, method=normalize,
+                                  window=norm_window, sensitivity=norm_sensitivity)
+    else:
+        signal = sig
+
+    exec_sig_full = signal.shift(exec_lag)
+    ret_full      = asset_obj_full.returns
+    pnl_full      = (exec_sig_full * ret_full).rename("pnl")
+
+    turnover    = exec_sig_full.fillna(0).diff().abs()
+    cost_pct    = fixed_per_side / (asset_obj_full.close * point_value) + fee_rate
+    tcost_full  = (turnover * cost_pct).rename("tcost")
+    pnl_net_full = (pnl_full - tcost_full).rename("pnl_net")
+
+    start, end = _resolve_dates(start_date, end_date)
+    if start is not None or end is not None:
+        eval_idx = _slice_index(asset_obj_full.index, start, end)
+        if len(eval_idx) == 0:
+            raise ValueError(f"No data in range [{start}, {end}]")
+        asset_obj = _subset_asset(asset_obj_full, eval_idx)
+        _ops.set_active_asset(asset_obj)
+        pnl     = pnl_full.reindex(eval_idx)
+        pnl_net = pnl_net_full.reindex(eval_idx)
+    else:
+        asset_obj = asset_obj_full
+        pnl       = pnl_full
+        pnl_net   = pnl_net_full
+
+    # Aggregate to per-calendar-day (sum of per-bar returns)
+    daily_pnl     = pnl.fillna(0).groupby(pnl.index.normalize()).sum()
+    daily_pnl_net = pnl_net.fillna(0).groupby(pnl_net.index.normalize()).sum()
+    daily_asset   = (asset_obj.returns.fillna(0)
+                     .groupby(asset_obj.returns.index.normalize()).sum())
+
+    fig, axes = plt.subplots(1, 3, figsize=(24, 6))
+    _plot_daily_by_weekday(axes[0], daily_pnl, daily_pnl_net)
+    _plot_daily_by_month  (axes[1], daily_pnl, daily_pnl_net)
+    _plot_daily_casr_expiry(axes[2], daily_pnl, daily_asset, window=expiry_window)
+    plt.tight_layout(); plt.show()
+
+    return {
+        "asset_obj":     asset_obj,
+        "daily_pnl":     daily_pnl,
+        "daily_pnl_net": daily_pnl_net,
+        "daily_asset":   daily_asset,
+    }
+
+
+_WEEKDAY_LABELS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+_MONTH_LABELS   = ["Jan", "Feb", "Mar", "Apr", "May", "Jun",
+                   "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
+
+
+def _bar_colors(vals):
+    return ["#00897b" if v >= 0 else "#c62828" for v in vals]
+
+
+def _plot_daily_by_weekday(ax, daily_pnl, daily_pnl_net):
+    """Avg daily PnL by weekday — gross bars, net markers overlaid."""
+    if daily_pnl.empty:
+        ax.text(0.5, 0.5, "no PnL", transform=ax.transAxes,
+                ha="center", va="center"); return
+    wd      = daily_pnl.index.dayofweek
+    mean_g  = daily_pnl.groupby(wd).mean()    * 100
+    mean_n  = daily_pnl_net.groupby(wd).mean() * 100
+    n       = daily_pnl.groupby(wd).count()
+    max_idx = max((i for i in mean_g.index if abs(mean_g.get(i, 0)) > 0), default=4)
+    idx     = list(range(0, max_idx + 1))
+    labels  = [_WEEKDAY_LABELS[i] for i in idx]
+    g_vals  = [float(mean_g.get(i, 0.0)) for i in idx]
+    n_vals  = [float(mean_n.get(i, 0.0)) for i in idx]
+
+    ax.bar(labels, g_vals, color=_bar_colors(g_vals), alpha=0.85,
+           label="gross")
+    ax.scatter(labels, n_vals, color="black", s=50, zorder=5, marker="D",
+               label="net")
+    for x, v, ct in zip(labels, g_vals, [int(n.get(i, 0)) for i in idx]):
+        ax.text(x, v, f"n={ct}", fontsize=8,
+                ha="center", va="bottom" if v >= 0 else "top", alpha=0.7)
+    ax.axhline(0, color="black", linewidth=0.8, linestyle="--", alpha=0.5)
+    ax.set_title("Avg daily PnL by weekday", fontsize=_FS)
+    ax.set_ylabel("Avg daily return (%)")
+    ax.legend(fontsize=_FSS, loc="best"); ax.grid(True, alpha=0.3, axis="y")
+
+
+def _plot_daily_by_month(ax, daily_pnl, daily_pnl_net):
+    """Avg daily PnL by calendar month — gross bars, net markers overlaid."""
+    if daily_pnl.empty:
+        ax.text(0.5, 0.5, "no PnL", transform=ax.transAxes,
+                ha="center", va="center"); return
+    mo     = daily_pnl.index.month
+    mean_g = daily_pnl.groupby(mo).mean()    * 100
+    mean_n = daily_pnl_net.groupby(mo).mean() * 100
+    n      = daily_pnl.groupby(mo).count()
+    idx    = list(range(1, 13))
+    g_vals = [float(mean_g.get(i, 0.0)) for i in idx]
+    n_vals = [float(mean_n.get(i, 0.0)) for i in idx]
+    labels = _MONTH_LABELS
+
+    ax.bar(labels, g_vals, color=_bar_colors(g_vals), alpha=0.85,
+           label="gross")
+    ax.scatter(labels, n_vals, color="black", s=50, zorder=5, marker="D",
+               label="net")
+    for x, v, ct in zip(labels, g_vals, [int(n.get(i, 0)) for i in idx]):
+        ax.text(x, v, f"n={ct}", fontsize=7,
+                ha="center", va="bottom" if v >= 0 else "top", alpha=0.7)
+    ax.axhline(0, color="black", linewidth=0.8, linestyle="--", alpha=0.5)
+    ax.set_title("Avg daily PnL by month", fontsize=_FS)
+    ax.set_ylabel("Avg daily return (%)")
+    ax.legend(fontsize=_FSS, loc="best"); ax.grid(True, alpha=0.3, axis="y")
+
+
+def _plot_daily_casr_expiry(ax, daily_pnl, daily_asset, window: int = 10):
+    """CASR ±`window` trading days around TAIFEX monthly expiry."""
+    trading_index = daily_pnl.index
+    if len(trading_index) < 2 * window + 1:
+        ax.text(0.5, 0.5, "not enough days for CASR",
+                transform=ax.transAxes, ha="center", va="center"); return
+
+    try:
+        result       = _ops.Caar(window, daily_pnl)
+        result_asset = _ops.Caar(window, daily_asset)
+    except ValueError as e:
+        ax.text(0.5, 0.5, str(e), transform=ax.transAxes,
+                ha="center", va="center", fontsize=_FS)
+        return
+
+    x       = result.index
+    casr    = result["casr"] * 100
+    se      = result["se"]
+    n       = int(result["n"].iloc[0])
+    cum_lo  = np.cumsum(result["mean"] - se) * 100
+    cum_hi  = np.cumsum(result["mean"] + se) * 100
+    bh_casr = result_asset["casr"] * 100
+
+    ax.plot(x, casr, linewidth=1.4, color="#1565c0",
+            marker="o", markersize=5, markerfacecolor="#1565c0",
+            markeredgecolor="white", markeredgewidth=0.6,
+            label=f"signal CASR  (n={n} expiries)")
+    ax.fill_between(x, cum_lo, cum_hi, alpha=0.2, color="#1565c0",
+                    label="±1 SE (signal)")
+    ax.plot(x, bh_casr, linewidth=1.2, color="#424242", linestyle="-",
+            alpha=0.85, label="buy & hold CAR")
+    ax.axvline(0, color="#c62828", linewidth=1.2, linestyle="--",
+               alpha=0.8, label="expiry")
+    ax.axhline(0, color="black", linewidth=0.8, linestyle="--", alpha=0.5)
+    ax.set_title(f"CASR ±{window}d around TAIFEX expiry  (signal vs buy-and-hold)",
+                 fontsize=_FS)
+    ax.set_xlabel("Trading days relative to expiry")
+    ax.set_ylabel("Cumulative avg return (%)")
+    ax.legend(fontsize=_FSS); ax.grid(True, alpha=0.3)
+
+
+__all__ = ["SimulateIntraday", "SimulateAllIntraday", "SimulateIntradayCalendar"]

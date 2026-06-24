@@ -327,6 +327,16 @@ def PctChange(n: int, s: pd.Series) -> pd.Series:
     return s.pct_change(n)
 
 
+def Sign(s: pd.Series) -> pd.Series:
+    """Sign of each element; preserves index/name. 0 stays 0, NaN stays NaN."""
+    return pd.Series(np.sign(s.values), index=s.index, name=getattr(s, "name", None))
+
+
+def Abs(s: pd.Series) -> pd.Series:
+    """Absolute value, index/name preserved."""
+    return s.abs()
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Event study
 # ─────────────────────────────────────────────────────────────────────────────
@@ -593,6 +603,7 @@ __all__ = [
     "InstMean", "InstStdev", "InstSkew", "InstSum", "InstCorr",
     "InstRank", "InstZScore",
     "Diff", "PctChange",
+    "Sign", "Abs",
     "Event", "Caar",
     "load_tsmc_ea_dates",
 ]
