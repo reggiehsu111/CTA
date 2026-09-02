@@ -222,45 +222,20 @@ def _resample_rule(granularity: str) -> str:
 
 
 def _load_intraday(asset: str, time_granularity: str) -> BaseAsset:
+    """Load intraday bars for `asset`, unioned across every source we have.
+
+    Delegates to cta.bars.load_1min, which merges the legacy MXFR1k.csv with the
+    Shioaji parquet (local and S3). This used to read MXFR1k.csv alone, which meant
+    MXF only and nothing after 2026-05-22 — the file's last bar — so any intraday
+    backtest silently stopped there while the daily series ran to today.
+
+    Coarser granularities resample from 1m. The 13:45 -> 15:00 break produces empty
+    buckets rather than bogus bars, and those are dropped.
     """
-    Load 1-minute (or coarser) bars for MXF/MTX from `MXFR1k.csv`.
+    from .bars import load_1min, resolve_symbol
 
-    The file is a 1-minute continuous-front MXF series with columns
-        ts, Open, High, Low, Close, Volume, Amount
-    spanning ~2023-03 to present, both day session (08:45-13:45) and
-    night session (15:00-05:00 next morning).
-
-    Coarser granularities (5m / 15m / 30m / 1h) resample from 1m via
-    standard OHLCV aggregation; the resampler respects the 13:45 → 15:00
-    gap because there are no rows in that interval (so empty buckets
-    appear and we drop them via `dropna`).
-    """
-    from pathlib import Path
-
-    code = asset.upper()
-    if code not in {"MTX", "MXF"}:
-        raise NotImplementedError(
-            f"Intraday data for {code!r} not available — only MXF/MTX is supported "
-            "(file: MXFR1k.csv)."
-        )
-
-    path = Path(__file__).parent.parent / "MXFR1k.csv"
-    if not path.exists():
-        raise FileNotFoundError(f"Intraday CSV not found: {path}")
-
-    df = pd.read_csv(
-        path,
-        parse_dates=["ts"],
-        dtype={"Open": "float32", "High": "float32", "Low": "float32",
-               "Close": "float32", "Volume": "int32", "Amount": "float64"},
-    ).set_index("ts").sort_index()
-    df.columns = df.columns.str.lower()
-    df = df[["open", "high", "low", "close", "volume"]]
-
-    # The CSV has ~20k duplicate timestamps clustered around contract rollovers
-    # (same minute observed on both OLD and NEW contract). Keep the LAST entry
-    # so the series rolls cleanly forward onto the new contract.
-    df = df[~df.index.duplicated(keep="last")]
+    sym = resolve_symbol(asset)
+    df = load_1min(sym)
 
     if time_granularity != "1m":
         rule = _resample_rule(time_granularity)
@@ -269,7 +244,7 @@ def _load_intraday(asset: str, time_granularity: str) -> BaseAsset:
                       "close": "last", "volume": "sum"})
                 .dropna(subset=["close"]))
 
-    return BaseAsset.from_df(df, symbol=code, time_granularity=time_granularity)
+    return BaseAsset.from_df(df, symbol=asset.upper(), time_granularity=time_granularity)
 
 
 # ─── RDS-backed 1d loader for TAIFEX index futures ────────────────────────
