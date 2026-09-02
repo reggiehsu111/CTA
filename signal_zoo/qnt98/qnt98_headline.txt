@@ -1,0 +1,9 @@
+QNT-98 candidate neighbourhoods (11 series x 144 arguments): 1584 cells = 11 source series x 144 transform-windows, n_eff ~ 229 (ICC(series) = 0.04). Per-series median SR_net +0.292, 11/11 positive, Wilcoxon p = 0.001. sd(SR_net) across cells = 0.343 vs SE(SR | 10y) = 0.319 (ratio 1.08) -> dispersion ~ the noise floor - ranking is mostly noise.
+  best cell SR_net = +1.158; expected max of 229 independent draws ~ +1.162  -> the best cell is what a null grid this size produces.
+  rule 4: sign fitted IS — per-series median SR_IS +0.453 vs SR_OOS +0.238; an IS/full-sample SR is not evidence of edge.
+  11/11 series disagree with themselves on sign across their own cells.
+QNT-98 control neighbourhoods (8 series x 144 arguments): 1152 cells = 8 source series x 144 transform-windows, n_eff ~ 71 (ICC(series) = 0.11). Per-series median SR_net +0.111, 7/8 positive, Wilcoxon p = 0.055. sd(SR_net) across cells = 0.244 vs SE(SR | 10y) = 0.307 (ratio 0.80) -> dispersion BELOW the noise floor - ranking cells ranks noise.
+  best cell SR_net = +0.998; expected max of 71 independent draws ~ +0.634  -> above the null best-of-n, but still search-corrected before quoting.
+  rule 2: dispersion is under the noise floor — do NOT quote a best cell as a result.
+  rule 4: sign fitted IS — per-series median SR_IS +0.307 vs SR_OOS +0.027; an IS/full-sample SR is not evidence of edge.
+  8/8 series disagree with themselves on sign across their own cells.

@@ -1,0 +1,3 @@
+floor,n_eff,cell_median,cell_winrate,cell_binom_p,series_median,series_winrate,series_binom_p,sigma_units
+pre,21.0,0.0708,0.636,0.0002,0.089,0.727,0.2266,0.41
+post,15.7,0.013,0.525,0.5225,0.0375,0.545,1.0,0.15

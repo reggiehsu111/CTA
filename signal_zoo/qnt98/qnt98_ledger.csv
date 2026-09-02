@@ -1,0 +1,4 @@
+grid,cells,S,four_gate_cells,med_SR_IS,med_SR_OOS,OOS_pos,binom_p
+G1 standalone 29 series,522,29,0,0.164,-0.056,11/29,0.265
+G2 night window 11 daily series,792,11,34,0.178,-0.015,5/11,1.0
+G3 slow window 21 series,1512,21,15,0.177,-0.007,10/21,1.0

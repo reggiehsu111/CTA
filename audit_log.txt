@@ -1,0 +1,36 @@
+
+[2026-08-31T19:35:35+00:00] QNT-10 asia macro ingest (agent: Claw-EC2, unattended)
+  tw_macro_monthly: upserted 583 | before: does not exist | after: 583 rows, 1978-01-01 → 2026-07-01
+  jp_macro_monthly: upserted 859 | before: does not exist | after: 859 rows, 1955-01-01 → 2026-07-01
+  jp_markets_daily: upserted 19838 | before: does not exist | after: 19838 rows, 1949-05-16 → 2026-08-31
+  DDL: CREATE TABLE IF NOT EXISTS on 3 NEW tables; no ALTER/DROP/TRUNCATE;
+       writes are INSERT ... ON CONFLICT DO UPDATE on `date` only.
+  sources: data.gov.tw/6019 — 消費者物價基本分類指數 (行政院主計總處); data.gov.tw/6637 — 人力資源調查失業率 (行政院主計總處); data.gov.tw/6024 — 貨幣總計數 (中央銀行經研處, EF15M01); data.gov.tw/6100 — 臺灣採購經理人指數 (國發會 / 中華經濟研究院); data.gov.tw/6099 — 景氣指標及燈號 (國家發展委員會); OECD SDMX COICOP2018 (JP CPI); FRED LRHUTTTTJPM156S,JPNASSETS,IRLTLT01JPM156N,NIKKEI225,DEXJPUS
+[2026-09-01T00:35:01Z] QNT-10 ingest_global_macro --commit: 43 series; macro_series 0->125234, macro_series_meta 0->43; source FRED CSV; CREATE TABLE IF NOT EXISTS + INSERT ON CONFLICT DO UPDATE only; no existing table read or written
+[2026-09-01T00:36:58Z] QNT-10 ingest_global_macro --commit: 7 series; macro_series 125234->125234, macro_series_meta 43->43; source FRED CSV; CREATE TABLE IF NOT EXISTS + INSERT ON CONFLICT DO UPDATE only; no existing table read or written
+
+2026-09-01T07:32:54.352953Z  QNT-21 roll-fix backfill
+  approved_by : Reggie (Linear QNT-21) - 'Apply + backfill' 2026-09-01 06:34,
+                exact-SQL approval 'Approve' 2026-09-01 07:13
+  statement   : UPDATE mtx_signal_values SET pnl_1d = :new_pnl WHERE date = :d AND signal_name = :s AND variant = :v
+  rows        : 6277 (c2c 2643, o2o 2562, noonpause 1072) of 382986
+  date range  : 2001-04-19 .. 2026-08-20
+  columns     : pnl_1d only
+  pre-image   : /home/ubuntu/mtx/signal_zoo/roll_rescore/backfill_preimage.csv
+  rollback    : restore pnl_1d from the pre-image CSV on (date, signal_name, variant)
+
+2026-09-01T07:42:57Z  QNT-19 macro PIT floor (code change, no DB write)
+  approved_by : Reggie (Linear QNT-19) - 'Approve the floor' 2026-09-01 06:34
+  change      : cta/global_macro.py - load_macro_tw / load_macro_yoy_tw now resolve
+                max(macro_series_meta.pub_lag_days, MACRO_MIN_PUB_LAG_DAYS=1).
+                Binds on the 12 daily FRED series (pub_lag_days=0); no-op on the other 31.
+                enforce_floor=False reproduces the pre-QNT-19 alignment.
+  also        : cta/__init__.py exports MACRO_MIN_PUB_LAG_DAYS;
+                cta/signals/_base.py shift_override comment block updated;
+                tools/check_macro_shift_overrides.py added (guard, passes).
+  db          : none. No table read or written by this change beyond the existing
+                read-only macro_series / macro_series_meta SELECTs.
+  evidence    : signal_zoo/qnt19_postfloor/ (re-runs + QNT19_FOOTNOTE.md);
+                pre-floor artifacts left untouched in macro_sweep/, macro_windows/,
+                macro_combo/, macro_regime/.
+  rollback    : set MACRO_MIN_PUB_LAG_DAYS = 0 in cta/global_macro.py.

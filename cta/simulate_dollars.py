@@ -13,8 +13,6 @@ Entry point
 
 from __future__ import annotations
 
-import matplotlib.gridspec as gridspec
-import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 
@@ -275,23 +273,32 @@ def simulate_by_dollars(
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _plot_dollars(main, amount_runs, spread_runs, rollover_off, dollar_amount):
+    import matplotlib.pyplot as plt
+    import matplotlib.gridspec as gridspec
+
     fig = plt.figure(figsize=(20, 14))
     gs  = gridspec.GridSpec(3, 2, figure=fig, hspace=0.38, wspace=0.22)
 
-    # (0,0) Paper vs actual gross vs actual net
+    # (0,0) Account equity — paper vs actual gross vs actual net.
+    # Lines start at `dollar_amount` and track equity over time, so the chart
+    # is readable as "what's the account worth right now".
     ax = fig.add_subplot(gs[0, 0])
     cum_paper = main["paper_pnl"].cumsum()
     cum_gross = main["actual_pnl_gross"].cumsum()
     cum_net   = main["actual_pnl_net"].cumsum()
-    ax.plot(cum_paper.index, cum_paper.values / 1e3, color="#1565c0", linewidth=1.3,
-            label=f"Paper PnL (fractional)  end {cum_paper.iloc[-1]/1e3:,.1f}K")
-    ax.plot(cum_gross.index, cum_gross.values / 1e3, color="#00897b", linewidth=1.3,
-            label=f"Actual PnL gross (integer)  end {cum_gross.iloc[-1]/1e3:,.1f}K")
-    ax.plot(cum_net.index,   cum_net.values   / 1e3, color="#c62828", linewidth=1.3,
-            label=f"Actual PnL net (after costs)  end {cum_net.iloc[-1]/1e3:,.1f}K")
-    ax.axhline(0, color="black", linewidth=0.6, linestyle="--", alpha=0.5)
-    ax.set_title(f"Cumulative PnL — paper vs actual  (D = {dollar_amount:,.0f} NTD)", fontsize=14)
-    ax.set_ylabel("Cumulative PnL (K NTD)")
+    eq_paper = (cum_paper + dollar_amount) / 1e3
+    eq_gross = (cum_gross + dollar_amount) / 1e3
+    eq_net   = (cum_net   + dollar_amount) / 1e3
+    ax.plot(eq_paper.index, eq_paper.values, color="#1565c0", linewidth=1.3,
+            label=f"Paper equity (fractional)  end {eq_paper.iloc[-1]:,.1f}K")
+    ax.plot(eq_gross.index, eq_gross.values, color="#00897b", linewidth=1.3,
+            label=f"Actual equity gross (integer)  end {eq_gross.iloc[-1]:,.1f}K")
+    ax.plot(eq_net.index,   eq_net.values,   color="#c62828", linewidth=1.3,
+            label=f"Actual equity net (after costs)  end {eq_net.iloc[-1]:,.1f}K")
+    ax.axhline(dollar_amount / 1e3, color="black", linewidth=0.6, linestyle="--",
+               alpha=0.5, label=f"starting equity {dollar_amount/1e3:,.0f}K")
+    ax.set_title(f"Account equity — paper vs actual  (D = {dollar_amount:,.0f} NTD)", fontsize=14)
+    ax.set_ylabel("Equity (K NTD)")
     ax.legend(fontsize=10, loc="upper left")
     ax.grid(True, alpha=0.3)
 

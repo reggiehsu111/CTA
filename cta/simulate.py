@@ -23,9 +23,6 @@ from __future__ import annotations
 
 import math
 
-import matplotlib.gridspec as gridspec
-import matplotlib.pyplot as plt
-import matplotlib as mpl
 import numpy as np
 import pandas as pd
 
@@ -141,37 +138,25 @@ def normalize_signal(
     method: str = "tanh",
     window: int = 252,
     sensitivity: float = 1.0,
+    force: bool = True,        # deprecated — kept for back-compat, always True now
 ) -> pd.Series:
     """
-    Normalize a raw signal to (-1, 1) without look-ahead.
+    Normalize a signal to (-1, 1) without look-ahead.
 
-    Idempotent: if `sig` already lies entirely in [-1, 1] (e.g. a previously
-    normalized or pre-bounded signal), it is returned unchanged. This prevents
-    re-normalization from warping pre-normalized inputs and stops filtered
-    series (with NaN gaps) from picking up biased rolling stats over only the
-    kept dates.
+    Applies `method` unconditionally — no idempotence guard. Callers who
+    don't want re-normalization should pass their signal through `Simulate`
+    with `normalize=False` (the pipeline flag), rather than relying on this
+    helper to detect already-normalized inputs.
 
     Parameters
     ----------
-    sig         : raw signal, arbitrary scale, date-indexed
+    sig         : signal, arbitrary scale, date-indexed
     method      : 'tanh' (default) or 'rank'
     window      : rolling look-back window in bars
     sensitivity : tanh only — controls saturation speed (default 1.0)
+    force       : deprecated — no-op. Behaviour is now equivalent to force=True.
     """
     sig = sig.astype(float)
-
-    # ── Idempotence guard ────────────────────────────────────────────────────
-    # Skip re-normalization only when the signal looks like a previous
-    # normalization OUTPUT: bounded in [-1, 1] AND actually using the full
-    # range (reaches at least 0.9 in absolute value somewhere). A signal
-    # that's bounded but tiny (e.g. cal_spread ≈ ±0.05) is a raw input
-    # that needs to be spread out, so we still normalize it.
-    finite = sig.replace([np.inf, -np.inf], np.nan).dropna()
-    if not finite.empty:
-        max_abs = float(finite.abs().max())
-        if 0.9 <= max_abs <= 1.0 + 1e-9:
-            return sig
-
     if method == "tanh":
         return _normalize_tanh(sig, window=window, sensitivity=sensitivity)
     if method == "rank":
@@ -287,11 +272,117 @@ def _load_intraday(asset: str, time_granularity: str) -> BaseAsset:
     return BaseAsset.from_df(df, symbol=code, time_granularity=time_granularity)
 
 
+# ─── RDS-backed 1d loader for TAIFEX index futures ────────────────────────
+# The Lambda ingest lambdas keep tw_index_futures_pv fresh through the day.
+# Reading from RDS here means every runner invocation sees the newest bar
+# without a Lambda zip rebuild.
+_RDS_INDEX_FUTURES_TICKERS = frozenset({"MTX", "TX", "TE", "TF"})
+
+
+class _RdsEmptyError(RuntimeError):
+    """Raised when tw_index_futures_pv returns no rows for the ticker."""
+
+
+def _load_asset_from_rds(asset: str, contract: str = "front") -> BaseAsset:
+    """Build a 1d BaseAsset for a TAIFEX index-future ticker from RDS.
+
+    Mirrors the CSV loader's output columns exactly (front-month selection
+    by monthly-expiry rank, back-month close for rollover, night-session
+    columns merged onto the same date).
+    """
+    import os as _os
+    import sys as _sys
+
+    # Resolve QuantResearch/Libs across machines. The relative candidate covers
+    # both layouts (Mac: Research/{mtx,QuantResearch}; EC2: ~/{mtx,QuantResearch}),
+    # since this file sits three levels below that shared root.
+    _here = _os.path.dirname(_os.path.abspath(__file__))
+    _candidates = [
+        _os.environ.get("QUANTRESEARCH_LIBS"),
+        _os.path.join(_os.path.dirname(_os.path.dirname(_here)), "QuantResearch", "Libs"),
+        "/home/ubuntu/QuantResearch/Libs",
+        "/Users/hsureggie/coding/Research/QuantResearch/Libs",
+    ]
+    for _cand in _candidates:
+        if _cand and _os.path.isdir(_cand):
+            if _cand not in _sys.path:
+                _sys.path.insert(0, _cand)
+            break
+    else:
+        raise RuntimeError(
+            "QuantResearch/Libs not found - tried: "
+            + ", ".join(repr(c) for c in _candidates if c)
+            + ". Set QUANTRESEARCH_LIBS to its path."
+        )
+    from db_utils import engine as _engine  # local import — Libs path required
+
+    code = asset.upper()
+    raw = pd.read_sql(
+        "SELECT date, expiry_month, open, high, low, close, volume, "
+        "settle, open_interest, bid, ask, "
+        "night_open, night_high, night_low, night_close, night_volume "
+        "FROM tw_index_futures_pv "
+        "WHERE ticker = %(t)s ORDER BY date, expiry_month",
+        _engine,
+        params={"t": code},
+    )
+    if raw.empty:
+        raise _RdsEmptyError(f"tw_index_futures_pv has no rows for {code!r}")
+
+    raw["date"] = pd.to_datetime(raw["date"])
+    for col in ("open", "high", "low", "close", "volume",
+                "settle", "open_interest", "bid", "ask",
+                "night_open", "night_high", "night_low", "night_close", "night_volume"):
+        raw[col] = pd.to_numeric(raw[col], errors="coerce")
+
+    # Rank by expiry within each date; weekly expiries (e.g. '202608W1')
+    # → NaN via to_numeric and sort to the end, so front-month = smallest
+    # monthly integer, matching the CSV loader's semantics.
+    raw["_expiry_int"] = pd.to_numeric(raw["expiry_month"], errors="coerce")
+    raw = raw.sort_values(["date", "_expiry_int"])
+    raw["_rank"] = raw.groupby("date").cumcount()
+
+    front_rank = 0 if contract == "front" else 1
+    back_rank  = front_rank + 1
+
+    front = raw[raw["_rank"] == front_rank].copy()
+    back  = raw[raw["_rank"] == back_rank][["date", "expiry_month", "open", "close"]].rename(
+        columns={"expiry_month": "back_expiry", "open": "back_open", "close": "back_close"}
+    )
+
+    front = front.rename(columns={
+        "expiry_month":  "front_expiry",
+        "settle":        "settlement",
+        "open_interest": "oi",
+    })
+
+    keep_cols = [
+        "date", "front_expiry",
+        "open", "high", "low", "close", "volume", "settlement", "oi", "bid", "ask",
+        "night_open", "night_high", "night_low", "night_close", "night_volume",
+    ]
+    front = front[keep_cols].merge(back, on="date", how="left")
+
+    series = front.set_index("date").sort_index()
+    series = series.dropna(subset=["open", "high", "low", "close"])
+
+    symbol = code if contract == "front" else f"{code}_back"
+    return BaseAsset.from_df(series, symbol=symbol, time_granularity="1d")
+
+
 def _load_asset(asset: str, time_granularity: str, contract: str = "front") -> BaseAsset:
     if time_granularity in _INTRADAY_GRANULARITIES:
         return _load_intraday(asset, time_granularity)
     if time_granularity != "1d":
         raise NotImplementedError(f"Granularity '{time_granularity}' is not yet supported.")
+
+    # TAIFEX index futures are stored in RDS (tw_index_futures_pv) — always fresh.
+    # Falls back to CSV history for tickers not present in RDS.
+    if asset.upper() in _RDS_INDEX_FUTURES_TICKERS:
+        try:
+            return _load_asset_from_rds(asset, contract)
+        except _RdsEmptyError:
+            pass  # fall through to CSV loader below
 
     import csv
 
@@ -350,8 +441,9 @@ def _load_asset(asset: str, time_granularity: str, contract: str = "front") -> B
 
     # ── Back-month (next-rank) close — needed for rollover-adjusted returns ──
     back_rank = front_rank + 1
-    back = day[day["_rank"] == back_rank][["date", "expiry", "close"]].rename(columns={
+    back = day[day["_rank"] == back_rank][["date", "expiry", "open", "close"]].rename(columns={
         "expiry": "back_expiry",
+        "open":   "back_open",
         "close":  "back_close",
     })
     selected = selected.merge(back, on="date", how="left")
@@ -553,11 +645,14 @@ _DEFAULT_TSMC_EA_PATH = _Path(__file__).parent.parent / "tsmc_ea.csv"
 
 def _plot(asset_obj, asset_obj_back, signal, exec_sig, pnl, cum_pnl,
           tcost, pnl_net, cum_pnl_net):
+    import matplotlib.pyplot as plt
+    import matplotlib.gridspec as gridspec
+
     fig = plt.figure(figsize=(30, 40))
     gs  = gridspec.GridSpec(5, 3, figure=fig, hspace=0.55, wspace=0.30)
     axes = [[fig.add_subplot(gs[r, c]) for c in range(3)] for r in range(5)]
 
-    _plot_cum_pnl(axes[0][0], pnl, cum_pnl)
+    _plot_cum_pnl(axes[0][0], pnl, cum_pnl, pnl_net, cum_pnl_net)
     _plot_price_comparison(axes[0][1], asset_obj, exec_sig)
     _plot_turnover(axes[0][2], exec_sig)
 
@@ -584,19 +679,25 @@ def _plot(asset_obj, asset_obj_back, signal, exec_sig, pnl, cum_pnl,
 # Individual subplot helpers
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _plot_cum_pnl(ax, pnl: pd.Series, cum_pnl: pd.Series) -> None:
-    """(0,0) Cumulative PnL — close-price execution."""
-    sharpe = _sharpe(pnl)
-    ax.plot(cum_pnl.index, cum_pnl.values, linewidth=1.2, color="#1565c0")
+def _plot_cum_pnl(ax, pnl: pd.Series, cum_pnl: pd.Series,
+                  pnl_net: pd.Series | None = None,
+                  cum_pnl_net: pd.Series | None = None) -> None:
+    """(0,0) Cumulative PnL — gross + net (post-cost) overlaid with both Sharpes."""
+    sr_g = _sharpe(pnl)
+    ax.plot(cum_pnl.index, cum_pnl.values, linewidth=1.2, color="#1565c0",
+            label=f"gross  (SR {sr_g:+.2f})")
+    if cum_pnl_net is not None and pnl_net is not None:
+        sr_n = _sharpe(pnl_net)
+        ax.plot(cum_pnl_net.index, cum_pnl_net.values, linewidth=1.2, color="#c62828",
+                label=f"net (post-cost)  (SR {sr_n:+.2f})")
     ax.axhline(0, color="black", linewidth=0.8, linestyle="--", alpha=0.5)
     ax.fill_between(cum_pnl.index, cum_pnl.values, 0,
-                    where=(cum_pnl.values >= 0), alpha=0.20, color="#00897b")
+                    where=(cum_pnl.values >= 0), alpha=0.15, color="#00897b")
     ax.fill_between(cum_pnl.index, cum_pnl.values, 0,
-                    where=(cum_pnl.values <  0), alpha=0.20, color="#c62828")
-    ax.set_title(f"Cum PnL — close  (Sharpe {sharpe:.2f})", fontsize=_FS)
-    ax.set_xlabel("Date")
-    ax.set_ylabel("Cumulative return")
-    ax.grid(True, alpha=0.3)
+                    where=(cum_pnl.values <  0), alpha=0.15, color="#c62828")
+    ax.set_title("Cum PnL — gross vs net (close execution)", fontsize=_FS)
+    ax.set_xlabel("Date"); ax.set_ylabel("Cumulative return")
+    ax.legend(fontsize=_FSS, loc="upper left"); ax.grid(True, alpha=0.3)
 
 
 def _plot_price_comparison(ax, asset_obj, exec_sig: pd.Series) -> None:
@@ -680,6 +781,8 @@ def _plot_by_dom(ax, pnl: pd.Series) -> None:
 
 def _plot_by_doy(ax, pnl: pd.Series) -> None:
     """(1,2) Cumulative PnL within each calendar year, plotted against day-of-year."""
+    import matplotlib.pyplot as plt
+
     years = sorted(pnl.index.year.unique())
     cmap  = plt.cm.get_cmap("tab20", len(years))
 
@@ -848,39 +951,32 @@ def _plot_front_vs_back(ax, asset_obj, asset_obj_back, exec_sig, pnl, cum_pnl) -
 def _plot_casr(ax, signal: pd.Series, asset_obj,
                window: int = 30) -> None:
     """
-    (3,0) CASR around TAIFEX expiry — signal PnL CASR (blue, with ±1 SE band)
-    overlaid with the asset's buy-and-hold CAR (grey) for the same events,
-    so you can read 'is my signal beating buy-and-hold around expiry?'.
+    (3,0) CASR around TAIFEX expiry — signal PnL CASR (blue, with ±1 SE band).
     """
     trading_index = asset_obj.index
-    casr_pnl  = (signal.shift(2) * asset_obj.returns).reindex(trading_index)
-    asset_ret = asset_obj.returns.reindex(trading_index)
+    casr_pnl = (signal.shift(2) * asset_obj.returns).reindex(trading_index)
     try:
-        result       = _ops.Caar(window, casr_pnl)
-        result_asset = _ops.Caar(window, asset_ret)
+        result = _ops.Caar(window, casr_pnl)
     except ValueError as e:
         ax.text(0.5, 0.5, str(e), transform=ax.transAxes,
                 ha="center", va="center", fontsize=_FS)
         return
 
-    x       = result.index
-    casr    = result["casr"]
-    se      = result["se"]
-    n       = int(result["n"].iloc[0])
-    cum_lo  = np.cumsum(result["mean"] - se)
-    cum_hi  = np.cumsum(result["mean"] + se)
-    bh_casr = result_asset["casr"]
+    x      = result.index
+    casr   = result["casr"]
+    se     = result["se"]
+    n      = int(result["n"].iloc[0])
+    cum_lo = np.cumsum(result["mean"] - se)
+    cum_hi = np.cumsum(result["mean"] + se)
 
     ax.plot(x, casr, linewidth=1.4, color="#1565c0",
             marker="o", markersize=5, markerfacecolor="#1565c0",
             markeredgecolor="white", markeredgewidth=0.6,
             label=f"signal CASR  (n={n} expiries)")
-    ax.fill_between(x, cum_lo, cum_hi, alpha=0.2, color="#1565c0", label="±1 SE (signal)")
-    ax.plot(x, bh_casr, linewidth=1.2, color="#424242", linestyle="-", alpha=0.85,
-            label="buy & hold CAR")
+    ax.fill_between(x, cum_lo, cum_hi, alpha=0.2, color="#1565c0", label="±1 SE")
     ax.axvline(0, color="#c62828", linewidth=1.2, linestyle="--", alpha=0.8, label="expiry")
     ax.axhline(0, color="black", linewidth=0.8, linestyle="--", alpha=0.5)
-    ax.set_title(f"CASR ±{window}d around expiry  (signal vs buy-and-hold)", fontsize=_FS)
+    ax.set_title(f"CASR ±{window}d around expiry", fontsize=_FS)
     ax.set_xlabel("Days relative to expiry")
     ax.set_ylabel("Cumulative avg return")
     ax.legend(fontsize=_FSS)
@@ -890,63 +986,62 @@ def _plot_casr(ax, signal: pd.Series, asset_obj,
 def _plot_tsmc_ea_casr(ax, signal: pd.Series, asset_obj,
                         ea_path, window: int = 10) -> None:
     """
-    (4,0) CASR around TSMC earnings-announcement / investor-day events.
+    (4,0) CASR around TSMC official quarterly earnings calls
+    (`tsmc_quarterly_call` — the 4x/year 法說會 only, NOT broker
+    conferences or investor days).
 
-    Loads the dates from `ea_path` (TWSE Big5 CSV), maps midnight events
-    to the next day, snaps to trading days, then computes the cumulative
-    average signal return in a ±`window`-day window around each event.
+    `ea_path` is kept in the signature for backward compatibility but is
+    now ignored: dates come from `cta.load_tsmc_event_dates('quarterly_call',
+    trading_index)`, which parses the same underlying CSV and filters to
+    the quarterly-call category.
     """
     trading_index = asset_obj.index
 
     try:
-        ea_dates = _ops.load_tsmc_ea_dates(ea_path, trading_index)
+        from .tsmc_events import load_tsmc_event_dates
+        ea_dates = load_tsmc_event_dates("quarterly_call", trading_index)
     except FileNotFoundError as e:
         ax.text(0.5, 0.5, f"TSMC EA CSV not found:\n{e}",
                 transform=ax.transAxes, ha="center", va="center", fontsize=_FSS)
-        ax.set_title("CASR — TSMC earnings announcements", fontsize=_FS)
+        ax.set_title("CASR — TSMC quarterly earnings calls", fontsize=_FS)
         return
     except Exception as e:
-        ax.text(0.5, 0.5, f"Failed to load TSMC EA: {e}",
+        ax.text(0.5, 0.5, f"Failed to load TSMC quarterly calls: {e}",
                 transform=ax.transAxes, ha="center", va="center", fontsize=_FSS)
-        ax.set_title("CASR — TSMC earnings announcements", fontsize=_FS)
+        ax.set_title("CASR — TSMC quarterly earnings calls", fontsize=_FS)
         return
 
     if len(ea_dates) == 0:
-        ax.text(0.5, 0.5, "No TSMC EA events in the asset's trading range",
+        ax.text(0.5, 0.5, "No TSMC quarterly calls in the asset's trading range",
                 transform=ax.transAxes, ha="center", va="center", fontsize=_FSS)
-        ax.set_title("CASR — TSMC earnings announcements", fontsize=_FS)
+        ax.set_title("CASR — TSMC quarterly earnings calls", fontsize=_FS)
         return
 
-    casr_pnl  = (signal.shift(2) * asset_obj.returns).reindex(trading_index)
-    asset_ret = asset_obj.returns.reindex(trading_index)
+    casr_pnl = (signal.shift(2) * asset_obj.returns).reindex(trading_index)
 
     try:
-        result       = _ops.Caar(window, casr_pnl,  event_dates=ea_dates)
-        result_asset = _ops.Caar(window, asset_ret, event_dates=ea_dates)
+        result = _ops.Caar(window, casr_pnl, event_dates=ea_dates)
     except ValueError as e:
         ax.text(0.5, 0.5, str(e), transform=ax.transAxes,
                 ha="center", va="center", fontsize=_FSS)
         return
 
-    x       = result.index
-    casr    = result["casr"]
-    se      = result["se"]
-    n       = int(result["n"].iloc[0])
-    cum_lo  = np.cumsum(result["mean"] - se)
-    cum_hi  = np.cumsum(result["mean"] + se)
-    bh_casr = result_asset["casr"]
+    x      = result.index
+    casr   = result["casr"]
+    se     = result["se"]
+    n      = int(result["n"].iloc[0])
+    cum_lo = np.cumsum(result["mean"] - se)
+    cum_hi = np.cumsum(result["mean"] + se)
 
     ax.plot(x, casr, linewidth=1.4, color="#e65100",
             marker="o", markersize=5, markerfacecolor="#e65100",
             markeredgecolor="white", markeredgewidth=0.6,
-            label=f"signal CASR  (n={n} TSMC EAs)")
-    ax.fill_between(x, cum_lo, cum_hi, alpha=0.2, color="#e65100", label="±1 SE (signal)")
-    ax.plot(x, bh_casr, linewidth=1.2, color="#424242", linestyle="-", alpha=0.85,
-            label="buy & hold CAR")
-    ax.axvline(0, color="#c62828", linewidth=1.2, linestyle="--", alpha=0.8, label="EA date")
+            label=f"signal CASR  (n={n} quarterly calls)")
+    ax.fill_between(x, cum_lo, cum_hi, alpha=0.2, color="#e65100", label="±1 SE")
+    ax.axvline(0, color="#c62828", linewidth=1.2, linestyle="--", alpha=0.8, label="earnings call")
     ax.axhline(0, color="black", linewidth=0.8, linestyle="--", alpha=0.5)
-    ax.set_title(f"CASR ±{window}d around TSMC EAs  (signal vs buy-and-hold)", fontsize=_FS)
-    ax.set_xlabel("Days relative to EA")
+    ax.set_title(f"CASR ±{window}d around TSMC quarterly earnings calls", fontsize=_FS)
+    ax.set_xlabel("Days relative to earnings call")
     ax.set_ylabel("Cumulative avg return")
     ax.legend(fontsize=_FSS)
     ax.grid(True, alpha=0.3)
@@ -1080,6 +1175,8 @@ def SimulateAll(
     end_date         : restrict the evaluation window. If None, fall back to
                        whatever ``cta.set_date_range`` set.
     """
+    import matplotlib.pyplot as plt
+
     if not sigs:
         raise ValueError("Provide at least one signal.")
 

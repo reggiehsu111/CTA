@@ -21,3 +21,14 @@ venv/
 
 # macOS
 .DS_Store
+
+# Large DB dumps — regenerable from RDS, and the biggest exceed GitHub's 100MB file limit
+tw_margin/*.csv
+taifex_large_trader.csv
+taifex_txo_daily.csv
+taifex_three_majors.csv
+us_indexes.csv
+tsmc_ea.csv
+
+# signal_zoo intermediate pickles
+signal_zoo/**/*.pkl

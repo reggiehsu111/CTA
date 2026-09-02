@@ -337,6 +337,47 @@ def Abs(s: pd.Series) -> pd.Series:
     return s.abs()
 
 
+def Date(field: str) -> pd.Series:
+    """Return a date/time-of-index feature from the active asset as a pd.Series.
+
+    Convenient for building calendar-aware filters, e.g.
+        mask = (cta.Date('dom') < 17) | (cta.Date('dom') > 23)
+        filtered = cta.Filter(signal, mask)
+
+    Fields
+    ------
+    'dom' | 'day'       : day of month (1..31)
+    'dow' | 'weekday'   : day of week (Mon=0 .. Sun=6)
+    'month'             : month (1..12)
+    'year'              : four-digit year
+    'quarter'           : 1..4
+    'week' | 'isoweek'  : ISO week number (1..53)
+    'doy'               : day of year (1..366)
+    'hour'              : 0..23 (intraday)
+    'minute'            : 0..59 (intraday)
+    'time_of_day'       : minute since midnight (intraday)
+    """
+    asset = _require_asset()
+    idx = asset.index
+    key = field.lower()
+    if key in ("dom", "day"):     out = idx.day
+    elif key in ("dow", "weekday"): out = idx.dayofweek
+    elif key == "month":          out = idx.month
+    elif key == "year":           out = idx.year
+    elif key == "quarter":        out = idx.quarter
+    elif key in ("week", "isoweek"): out = idx.isocalendar().week
+    elif key == "doy":            out = idx.dayofyear
+    elif key == "hour":           out = idx.hour
+    elif key == "minute":         out = idx.minute
+    elif key == "time_of_day":    out = idx.hour * 60 + idx.minute
+    else:
+        raise ValueError(
+            f"Unknown date field {field!r}. Choose from: "
+            "dom, dow, month, year, quarter, week, doy, hour, minute, time_of_day"
+        )
+    return pd.Series(np.asarray(out), index=idx, name=f"date_{key}")
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Event study
 # ─────────────────────────────────────────────────────────────────────────────
@@ -490,17 +531,37 @@ def _signed_event_distance(trading_index: pd.DatetimeIndex,
     return out
 
 
+_TSMC_CATEGORY_ALIASES = {
+    "tsmc_quarterly_call":    "quarterly_call",
+    "tsmc_earnings":          "quarterly_call",    # convenience alias
+    "tsmc_investor_day":      "investor_day",
+    "tsmc_broker_conference": "broker_conference",
+    "tsmc_broker":            "broker_conference", # convenience alias
+    "tsmc_other":             "other",
+}
+
+# expiry aliases
+_EXPIRY_ALIASES = {"optexp", "futures_expire", "futures_expiry", "expiry"}
+
+
 def Event(name: str) -> pd.Series:
     """
     Signed trading-day distance to the nearest event of type `name`.
 
     Parameters
     ----------
-    name : event type. Currently supported:
-        'optexp'   — TAIFEX monthly futures/options expiry (3rd Wednesday).
-        'tsmc_ea'  — TSMC earnings-announcement / investor-relations events,
-                     loaded from the repo's `tsmc_ea.csv` with midnight events
-                     mapped to the next day and snapped to trading days.
+    name : event type. Supported:
+        'optexp' / 'futures_expire'
+                        — TAIFEX monthly futures/options expiry (3rd Wednesday).
+        'tsmc_ea'       — ALL TSMC investor-relations events lumped together
+                          (back-compat with the original `load_tsmc_ea_dates`).
+        'tsmc_quarterly_call' / 'tsmc_earnings'
+                        — the 4x/year 法說會 official earnings announcement (~86 events).
+        'tsmc_investor_day'
+                        — TSMC-hosted capital-markets days (Investor Day, ~4 events).
+        'tsmc_broker_conference' / 'tsmc_broker'
+                        — sell-side broker/bank conference re-broadcast (~116 events).
+        'tsmc_other'    — unclassified TSMC IR rows.
 
     Returns
     -------
@@ -512,14 +573,14 @@ def Event(name: str) -> pd.Series:
     Example
     -------
         cta.load_asset('mtx', '1d')
-        ev_exp = cta.Event('optexp')
-        ev_ea  = cta.Event('tsmc_ea')
-        # near a TSMC EA: ..., -3, -2, -1, 0, 1, 2, 3, ..., -3, -2, -1, 0, ...
+        ev_exp = cta.Event('futures_expire')
+        ev_qc  = cta.Event('tsmc_quarterly_call')
+        ev_id  = cta.Event('tsmc_investor_day')
     """
     asset         = _require_asset()
     trading_index = asset.index
 
-    if name == "optexp":
+    if name in _EXPIRY_ALIASES:
         event_dates = _taifex_expiry_dates(trading_index)
         positions   = _event_positions(event_dates, trading_index)
         result      = _signed_event_distance(trading_index, positions)
@@ -539,7 +600,16 @@ def Event(name: str) -> pd.Series:
         result      = _signed_event_distance(trading_index, positions)
         return pd.Series(result, index=trading_index, name="event_tsmc_ea")
 
-    raise ValueError(f"Unknown event name '{name}'. Supported: 'optexp', 'tsmc_ea'")
+    if name in _TSMC_CATEGORY_ALIASES:
+        from .tsmc_events import load_tsmc_event_dates
+        category    = _TSMC_CATEGORY_ALIASES[name]
+        event_dates = load_tsmc_event_dates(category, trading_index)
+        positions   = _event_positions(event_dates, trading_index)
+        result      = _signed_event_distance(trading_index, positions)
+        return pd.Series(result, index=trading_index, name=f"event_{name}")
+
+    supported = ["optexp", "futures_expire", "tsmc_ea"] + list(_TSMC_CATEGORY_ALIASES)
+    raise ValueError(f"Unknown event name '{name}'. Supported: {supported}")
 
 
 def Caar(
@@ -594,6 +664,270 @@ def Caar(
     )
 
 
+def _events_to_positions(events: pd.Series, target_index: pd.Index) -> np.ndarray:
+    """Convert an event mask (0/1/bool/NaN) aligned to `target_index` → int positions where mask==1."""
+    ev = events.reindex(target_index)
+    if ev.dtype == bool:
+        return np.where(ev.fillna(False).values)[0]
+    return np.where(np.isclose(ev.fillna(0).astype(float).values, 1.0))[0]
+
+
+def EventFFill(
+    feature: pd.Series,
+    events: pd.Series,
+    offset: int = 0,
+    limit: int = 5,
+) -> pd.Series:
+    """
+    Form-1 event signal: sample `feature` at each event bar (optionally shifted
+    by `offset`) and forward-fill the value for up to `limit` bars.
+
+    Every event contributes ONE sample; the value persists for at most `limit`
+    trading days after being set and resets on the next event. Between events
+    (or beyond the fill window) the signal is NaN, so downstream code sees an
+    explicit "not active" state instead of stale data.
+
+    Parameters
+    ----------
+    feature  : the base feature series (date-indexed on active asset).
+    events   : mask series aligned to feature, 0/1/NaN or booleans. 1 = event.
+    offset   : sample-bar offset from the event date. Examples —
+                 0  → sample ON the event day  (Form 1 baseline)
+                -1  → sample 1 day BEFORE the event
+                +1  → sample 1 day AFTER  the event
+                +K  → sample K days AFTER  the event
+    limit    : forward-fill horizon (trading days). 5 = signal is live for
+               the first 5 days after being sampled, then NaN.
+
+    Returns
+    -------
+    pd.Series indexed like `feature`.
+
+    Example
+    -------
+        ev_qc = cta.Event('tsmc_quarterly_call')
+        # daily-return on event day, held for 5 trading days
+        sig = cta.EventFFill(cta.Returns('c', -1), ev_qc == 0, offset=0, limit=5)
+    """
+    feature = feature.astype(float)
+    idx     = feature.index
+    positions = _events_to_positions(events, idx)
+    if len(positions) == 0:
+        return pd.Series(np.nan, index=idx, name=f"eventffill_o{offset}_l{limit}")
+
+    shifted = positions + int(offset)
+    shifted = shifted[(shifted >= 0) & (shifted < len(idx))]
+    if len(shifted) == 0:
+        return pd.Series(np.nan, index=idx, name=f"eventffill_o{offset}_l{limit}")
+
+    out = pd.Series(np.nan, index=idx)
+    out.iloc[shifted] = feature.values[shifted]
+    return out.ffill(limit=limit).rename(f"eventffill_o{offset}_l{limit}")
+
+
+def EventRollingFFill(
+    feature: pd.Series,
+    events: pd.Series,
+    window: int,
+    offset: int = 0,
+    limit: int = 5,
+    min_periods: int | None = None,
+) -> pd.Series:
+    """
+    Form-2 / Form-3 event signal: sample `InstMean(window, feature)` at each
+    event bar (optionally shifted by `offset`), forward-fill for up to `limit`
+    bars, reset on the next event.
+
+    Choosing `offset` decides which rolling window sits inside the event
+    neighborhood:
+        offset =  0            → mean over feature[event-window+1 .. event]
+                                 (Form 2: rolling-mean AT event)
+        offset =  window       → mean over feature[event+1  .. event+window]
+                                 (Form 3: mean over the `window` post-event bars,
+                                  sampled the first day after the window closes)
+        offset =  window - 1   → mean over feature[event    .. event+window-1]
+                                 (post-event including event day itself)
+        offset = -1            → mean over feature[event-window .. event-1]
+                                 (mean of pre-event bars, sampled the day before)
+
+    All parameters otherwise mirror `EventFFill`.
+
+    Example
+    -------
+        ev_qc = cta.Event('tsmc_quarterly_call')
+        # Form 2: 5-day trailing mean sampled ON event, held for 5 days
+        sig2 = cta.EventRollingFFill(feature, ev_qc==0, window=5,
+                                      offset=0,  limit=5)
+        # Form 3: 5-day POST-event mean, sampled at event+5, held for 5 days
+        sig3 = cta.EventRollingFFill(feature, ev_qc==0, window=5,
+                                      offset=5,  limit=5)
+    """
+    feature = feature.astype(float)
+    idx     = feature.index
+    mp      = min_periods if min_periods is not None else max(1, window // 2)
+    rolled  = feature.rolling(window, min_periods=mp).mean()
+
+    positions = _events_to_positions(events, idx)
+    if len(positions) == 0:
+        return pd.Series(np.nan, index=idx,
+                         name=f"eventroll_w{window}_o{offset}_l{limit}")
+
+    shifted = positions + int(offset)
+    shifted = shifted[(shifted >= 0) & (shifted < len(idx))]
+    if len(shifted) == 0:
+        return pd.Series(np.nan, index=idx,
+                         name=f"eventroll_w{window}_o{offset}_l{limit}")
+
+    out = pd.Series(np.nan, index=idx)
+    out.iloc[shifted] = rolled.values[shifted]
+    return out.ffill(limit=limit).rename(
+        f"eventroll_w{window}_o{offset}_l{limit}"
+    )
+
+
+def Casr(
+    days: int,
+    signal: pd.Series,
+    events: pd.Series,
+    *,
+    show: bool = True,
+    figsize: tuple[float, float] = (13.0, 4.6),
+    exec_lag: int = 2,
+    title: str | None = None,
+):
+    """
+    Plot two subplots for an event study around user-supplied event centers.
+
+    Left  : average signal LEVEL from t=-days..+days, ±1 SE band.
+    Right : CASR — cumulative average signal-return around the same events,
+            ±1 SE band. Signal-return = signal.shift(exec_lag) * asset.returns.
+
+    Parameters
+    ----------
+    days   : half-window in trading days. Total window = 2*days + 1.
+    signal : the signal series (date-indexed). Its index defines the trading
+             calendar for the event lookup.
+    events : mask series aligned to `signal`, containing 0/1/NaN (or booleans).
+             Every bar where the mask == 1 is treated as an event center.
+             Example — study the day BEFORE a quarterly call:
+                 ev_qc = cta.Event('tsmc_quarterly_call')
+                 cta.Casr(10, signal, ev_qc == -1)
+             The full ±days window is averaged around each 1 in the mask,
+             independent of how close other 1s are (nearby events overlap
+             naturally in the averaging).
+    show   : if True, call `plt.show()` at the end; if False, return the
+             figure without displaying so the caller can compose further.
+    exec_lag : lag applied to the signal for the CASR (right) panel.
+               Default 2 matches `cta.Simulate` — signal at day D drives
+               PnL on D+2. Set to 0 to disable.
+    title  : optional overall figure title.
+
+    Returns
+    -------
+    dict with keys:
+        'signal_avg'  DataFrame(index=[-days..+days], cols=['mean','se','n'])
+        'casr'        DataFrame(index=[-days..+days], cols=['casr','mean','se','n'])
+        'fig'         matplotlib Figure
+        'axes'        (ax_left, ax_right)
+    """
+    import matplotlib.pyplot as plt
+
+    signal = signal.astype(float)
+    trading_index = signal.index
+
+    # Align events to the signal calendar and pick event positions.
+    ev = events.reindex(trading_index)
+    if ev.dtype == bool:
+        ev_positions = np.where(ev.fillna(False).values)[0]
+    else:
+        ev_positions = np.where(np.isclose(ev.fillna(0).astype(float).values, 1.0))[0]
+
+    if len(ev_positions) == 0:
+        raise ValueError("`events` mask has no True (==1) entries.")
+
+    n_bars = len(trading_index)
+    valid_positions = ev_positions[(ev_positions >= days) &
+                                    (ev_positions + days < n_bars)]
+    if len(valid_positions) == 0:
+        raise ValueError(
+            f"None of the {len(ev_positions)} events have a full ±{days}-day "
+            "window inside the signal's index."
+        )
+
+    # ── Left panel data: signal level averaged over -days..+days ─────────
+    sig_vals = signal.values                                 # float, NaN preserved
+    sig_mat  = np.full((len(valid_positions), 2 * days + 1), np.nan)
+    for i, pos in enumerate(valid_positions):
+        sig_mat[i, :] = sig_vals[pos - days: pos + days + 1]
+
+    import warnings as _w
+    with np.errstate(invalid="ignore"), _w.catch_warnings():
+        _w.filterwarnings("ignore", message="Mean of empty slice")
+        _w.filterwarnings("ignore", message="Degrees of freedom <= 0 for slice")
+        sig_mean = np.nanmean(sig_mat, axis=0)
+        sig_std  = np.nanstd (sig_mat, axis=0, ddof=1)
+        sig_n    = np.sum(~np.isnan(sig_mat), axis=0)
+    sig_se = sig_std / np.sqrt(np.maximum(sig_n, 1))
+
+    x = np.arange(-days, days + 1)
+    signal_avg = pd.DataFrame(
+        {"mean": sig_mean, "se": sig_se, "n": sig_n}, index=x
+    )
+
+    # ── Right panel data: CASR of signal-return around events ─────────────
+    asset      = _require_asset()
+    asset_ret  = asset.returns.reindex(trading_index)
+    exec_sig   = signal.shift(exec_lag) if exec_lag else signal
+    sig_pnl    = (exec_sig * asset_ret).reindex(trading_index)
+
+    event_dates = trading_index[valid_positions]
+    casr_df     = Caar(days, sig_pnl, event_dates=event_dates)
+
+    # ── Plot ─────────────────────────────────────────────────────────────
+    fig, (axL, axR) = plt.subplots(1, 2, figsize=figsize)
+
+    axL.plot(x, sig_mean, color="#1565c0", lw=1.5, marker="o", ms=4,
+             label=f"avg signal  (n={len(valid_positions)} events)")
+    axL.fill_between(x, sig_mean - sig_se, sig_mean + sig_se,
+                     color="#1565c0", alpha=0.20, label="±1 SE")
+    axL.axvline(0, color="#c62828", lw=1.0, ls="--", alpha=0.75, label="event day")
+    axL.axhline(0, color="black", lw=0.6, ls="--", alpha=0.5)
+    axL.set_xlabel("Days relative to event")
+    axL.set_ylabel("Average signal value")
+    axL.set_title(f"Signal level  (±{days}d around event)")
+    axL.legend(fontsize=8); axL.grid(alpha=0.3)
+
+    x2       = casr_df.index.values
+    casr     = casr_df["casr"].values
+    cum_lo   = np.cumsum(casr_df["mean"].values - casr_df["se"].values)
+    cum_hi   = np.cumsum(casr_df["mean"].values + casr_df["se"].values)
+    n_events = int(casr_df["n"].iloc[0])
+
+    axR.plot(x2, casr, color="#e65100", lw=1.4, marker="o", ms=4,
+             label=f"signal CASR  (n={n_events})")
+    axR.fill_between(x2, cum_lo, cum_hi, alpha=0.20, color="#e65100",
+                     label="±1 SE")
+    axR.axvline(0, color="#c62828", lw=1.0, ls="--", alpha=0.75, label="event day")
+    axR.axhline(0, color="black", lw=0.6, ls="--", alpha=0.5)
+    axR.set_xlabel("Days relative to event")
+    axR.set_ylabel("Cumulative avg return")
+    axR.set_title(f"CASR  (±{days}d around event, exec_lag={exec_lag})")
+    axR.legend(fontsize=8); axR.grid(alpha=0.3)
+
+    if title:
+        fig.suptitle(title, fontsize=11, y=1.02)
+    fig.tight_layout()
+    if show:
+        plt.show()
+
+    return {
+        "signal_avg": signal_avg,
+        "casr": casr_df,
+        "fig": fig,
+        "axes": (axL, axR),
+    }
+
+
 __all__ = [
     "set_active_asset",
     "Prices", "Returns",
@@ -603,7 +937,8 @@ __all__ = [
     "InstMean", "InstStdev", "InstSkew", "InstSum", "InstCorr",
     "InstRank", "InstZScore",
     "Diff", "PctChange",
-    "Sign", "Abs",
-    "Event", "Caar",
+    "Sign", "Abs", "Date",
+    "Event", "Caar", "Casr",
+    "EventFFill", "EventRollingFFill",
     "load_tsmc_ea_dates",
 ]

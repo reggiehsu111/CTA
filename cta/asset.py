@@ -24,8 +24,11 @@ _EXTRA    = [
     "settlement", "oi", "bid", "ask",
     # After-hours / 盤後 session OHLCV — present from 2017+ for TAIFEX index futures
     "night_open", "night_high", "night_low", "night_close", "night_volume",
-    # Back-month (rank+1) close & both contract identifiers — for rollover-aware returns
-    "back_close", "front_expiry", "back_expiry",
+    # Back-month (rank+1) open/close & both contract identifiers — for rollover-aware returns
+    # back_open is required by _base._prev_open_cc: without it the o2o leg falls
+    # back on the close-measured spread approximation, which removes only 32% of
+    # the roll error (QNT-21).
+    "back_close", "back_open", "front_expiry", "back_expiry",
 ]
 
 

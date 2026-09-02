@@ -13,7 +13,6 @@ simulate_midday_short_night_long  Short on day-session close, cover and go
 
 from __future__ import annotations
 
-import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 
@@ -204,6 +203,8 @@ def _plot_midday_short_night_long(
     active:     pd.Series,
     idx:        pd.DatetimeIndex,
 ) -> None:
+    import matplotlib.pyplot as plt
+
     sr_gross    = _sharpe(pnl_gross)
     sr_net      = _sharpe(pnl_net)
     sr_buyhold  = _sharpe(pnl_buyhold.replace(0, np.nan))

@@ -1,0 +1,96 @@
+====================================================================================================
+GRID 1 — QNT-12 standalone macro sweep  (macro_sweep/full_sweep.csv)
+====================================================================================================
+  522 cells = 29 series x 6 transforms x 3 windows   (18 cells per series)
+  ICC(series) on SR_full = 0.615  ->  design effect 11.5,  n_eff = 45.6 independent tests  (nominal 522)
+  ICC(series) on SR_of_SR = 0.489  ->  n_eff = 56.0
+  SR_full, all cells                 sd(SR) across cells = 0.139   SE(SR|25y) = 0.200   ratio 0.69   -> dispersion BELOW the noise floor - ranking cells ranks noise
+  SR_of_SR, all cells                sd(SR) across cells = 0.147   SE(SR|25y) = 0.200   ratio 0.73   -> dispersion BELOW the noise floor - ranking cells ranks noise
+
+  collapsed to one number per source series (n=29):
+  per-series median SR_full          n= 29  median +0.0890  mean +0.1251  range [-0.021,+0.411]  pos 26/29 (90%)  binom p=0.000  wilcoxon p=0.000  t p=0.000
+  per-series median SR_of_SR - 0.6   n= 29  median -0.4875  mean -0.4922  range [-0.717,-0.243]  pos 0/29 (0%)  binom p=1.000  wilcoxon p=1.000  t p=0.000
+
+  best CELL SR_of_SR = 0.577 (igrea_level|bdtanh|w252), gate 0.6
+  SE of an SR_of_SR estimated on 26 annual SRs ~ 0.212  ->  best cell is 0.11 SE below the gate, i.e. indistinguishable from it
+  max of 522 draws from N(0,0.147) around the mean 0.107: expected max ~ 0.417 at n_eff=56;  ~0.533 at n=522
+
+  the per-series SR_full positives are SIGN-SELECTION BIAS, not edge
+  (sign is fitted on IS<=2018, so IS and hence full-sample SR are mechanically positive):
+  per-series median SR_IS            n= 29  median +0.1640  mean +0.1952  range [-0.011,+0.468]  pos 28/29 (97%)  binom p=0.000  wilcoxon p=0.000  t p=0.000
+  per-series median SR_full          n= 29  median +0.0890  mean +0.1251  range [-0.021,+0.411]  pos 26/29 (90%)  binom p=0.000  wilcoxon p=0.000  t p=0.000
+  per-series median SR_OOS           n= 29  median -0.0480  mean -0.0513  range [-0.632,+0.577]  pos 11/29 (38%)  binom p=0.265  wilcoxon p=0.198  t p=0.299
+  -> the whole apparent macro tilt lives in the fitted half. OOS is a coin flip.
+  21/29 series do not even agree with themselves on SIGN across their own 18 cells.
+
+====================================================================================================
+GRID 2 — QNT-14 daily-macro window sweep  (macro_windows/window_sweep_full.csv)
+====================================================================================================
+  198 cells = 11 series x 18 transform-windows
+  ICC(series) on dSR(day-c2c) = 0.495  ->  n_eff = 21.0 independent tests (nominal 198)
+
+  AS REPORTED IN QNT-14 (cell level, treats 198 transforms as 198 tests):
+  dSR day@1 - c2c@2, per CELL        n=198  median +0.0708  mean +0.0398  range [-0.488,+0.347]  pos 126/198 (64%)  binom p=0.000  wilcoxon p=0.000  t p=0.001
+
+  RE-REPORTED at per-series n:
+  dSR day@1 - c2c@2, per SERIES      n= 11  median +0.0890  mean +0.0683  range [-0.246,+0.242]  pos 8/11 (73%)  binom p=0.227  wilcoxon p=0.102  t p=0.117
+  dSR o2o@2 - c2c@2, per SERIES      n= 11  median +0.0405  mean +0.0451  range [-0.051,+0.152]  pos 9/11 (82%)  binom p=0.065  wilcoxon p=0.024  t p=0.017
+
+  SR_c2c across 198 cells            sd(SR) across cells = 0.142   SE(SR|25y) = 0.201   ratio 0.71   -> dispersion BELOW the noise floor - ranking cells ranks noise
+  SR_day across 198 cells            sd(SR) across cells = 0.154   SE(SR|25y) = 0.202   ratio 0.76   -> dispersion BELOW the noise floor - ranking cells ranks noise
+  corr(SR_c2c, SR_day) across cells = 0.415  (within-series median 0.462)
+  => SE of a PAIRED dSR ~ 0.217;  observed per-series median +0.089 = 0.41 SE.  With n=11 series the SE of the median is ~0.065.
+
+====================================================================================================
+GRID 3 — QNT-18 slow-macro window sweep  (macro_windows/slow_window_sweep.csv)
+====================================================================================================
+  378 cells = 21 series x 18   (all variants at shift 2)
+  ICC(series) on dSR = 0.525  ->  n_eff = 38.1 (nominal 378)
+  dSR day@2 - c2c@2, per CELL        n=378  median -0.0322  mean -0.0338  range [-0.485,+0.312]  pos 156/378 (41%)  binom p=0.001  wilcoxon p=0.000  t p=0.000
+  dSR day@2 - c2c@2, per SERIES      n= 21  median -0.0108  mean -0.0317  range [-0.324,+0.173]  pos 8/21 (38%)  binom p=0.383  wilcoxon p=0.243  t p=0.223
+  SR_c2c across cells                sd(SR) across cells = 0.139   SE(SR|25y) = 0.202   ratio 0.69   -> dispersion BELOW the noise floor - ranking cells ranks noise
+
+====================================================================================================
+GRID 4 — QNT-18 registered-signal window sweep  (registered_window_sweep.csv)
+====================================================================================================
+  11 signals — here a cell IS a series, so n was already honest
+  dSR day - c2c, per SIGNAL          n= 11  median -0.0894  mean -0.1305  range [-0.523,+0.169]  pos 4/11 (36%)  binom p=0.549  wilcoxon p=0.147  t p=0.083
+  SR_c2c across signals              sd(SR) across cells = 0.257   SE(SR|25y) = 0.210   ratio 1.23   -> dispersion ~ the noise floor - ranking is mostly noise
+
+====================================================================================================
+GRID 5 — QNT-18 de-tilt test  (macro_windows/detilt_matched.csv)
+====================================================================================================
+  [daily macro / raw]  cells=198 series=11
+    per CELL                         n=198  median +0.0414  mean +0.0200  range [-0.369,+0.422]  pos 114/198 (58%)  binom p=0.039  wilcoxon p=0.086  t p=0.109
+    per SERIES                       n= 11  median +0.0699  mean +0.0522  range [-0.288,+0.290]  pos 8/11 (73%)  binom p=0.227  wilcoxon p=0.206  t p=0.306
+  [daily macro / detilt]  cells=198 series=11
+    per CELL                         n=198  median +0.0341  mean +0.0152  range [-0.341,+0.372]  pos 113/198 (57%)  binom p=0.055  wilcoxon p=0.150  t p=0.205
+    per SERIES                       n= 11  median +0.0651  mean +0.0467  range [-0.291,+0.282]  pos 8/11 (73%)  binom p=0.227  wilcoxon p=0.278  t p=0.352
+  [slow macro / raw]  cells=378 series=21
+    per CELL                         n=378  median -0.0500  mean -0.0481  range [-0.447,+0.312]  pos 135/378 (36%)  binom p=0.000  wilcoxon p=0.000  t p=0.000
+    per SERIES                       n= 21  median -0.0360  mean -0.0437  range [-0.326,+0.135]  pos 7/21 (33%)  binom p=0.189  wilcoxon p=0.111  t p=0.086
+  [slow macro / detilt]  cells=378 series=21
+    per CELL                         n=378  median -0.0488  mean -0.0441  range [-0.433,+0.275]  pos 147/378 (39%)  binom p=0.000  wilcoxon p=0.000  t p=0.000
+    per SERIES                       n= 21  median -0.0426  mean -0.0386  range [-0.290,+0.137]  pos 10/21 (48%)  binom p=1.000  wilcoxon p=0.168  t p=0.116
+  [registered / raw]  cells=11 series=11
+    per CELL                         n= 11  median -0.1069  mean -0.1568  range [-0.538,+0.066]  pos 2/11 (18%)  binom p=0.065  wilcoxon p=0.014  t p=0.019
+    per SERIES                       n= 11  median -0.1069  mean -0.1568  range [-0.538,+0.066]  pos 2/11 (18%)  binom p=0.065  wilcoxon p=0.014  t p=0.019
+  [registered / detilt]  cells=11 series=11
+    per CELL                         n= 11  median -0.0833  mean -0.0979  range [-0.332,+0.060]  pos 3/11 (27%)  binom p=0.227  wilcoxon p=0.014  t p=0.017
+    per SERIES                       n= 11  median -0.0833  mean -0.0979  range [-0.332,+0.060]  pos 3/11 (27%)  binom p=0.227  wilcoxon p=0.014  t p=0.017
+
+====================================================================================================
+GRID 6 — QNT-16 macro combination  (macro_combo/)
+====================================================================================================
+  EW3 headline SR_of_SR = 0.542 on 25 annual SRs, gate 0.60
+  SR_of_SR is itself a Sharpe of the yearly-SR sample: SE ~ sqrt((1+SRSR^2/2)/n_years) = 0.214
+  -> the gate sits 0.27 SE away. 95% CI ~ [0.12, 0.96] — it contains both 0 and 0.6.
+  n of independent legs = 3 (igrea, epu_global, kr_kospi), pnl corr 0.16-0.40
+
+  the SAME EW3 basket across its 18 transform-window cells (combo_family_sweep.csv):
+    SR_of_SR  min 0.263  median 0.419  max 0.581  sd 0.102
+    the headline 0.542 is not even the family's own median-cell value; the best cell (EW3|bdtanh|w120) is 0.581, still < 0.6.
+    sd across the 18 cells (0.102) vs SE of one estimate (0.214) -> ratio 0.47: picking the best cell of 18 is picking noise.
+    gate_srsr passes in 0/18 cells.
+
+wrote /home/ubuntu/mtx/signal_zoo/qnt25_headline_tests.csv, qnt25_g1_per_series.csv, qnt25_g2_per_series.csv

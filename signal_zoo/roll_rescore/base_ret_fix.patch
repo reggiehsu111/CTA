@@ -1,0 +1,146 @@
+--- /home/ubuntu/mtx/cta/signals/_base.py	2026-09-01 03:51:50.991245901 +0000
++++ proposed/cta/signals/_base.py	2026-09-01 06:02:26.578800164 +0000
+@@ -156,8 +156,75 @@
+     cost_of:     Callable[[pd.DataFrame], pd.Series]
+ 
+ 
++def _is_rollover(asset: pd.DataFrame) -> pd.Series:
++    """True on days whose front-month contract differs from yesterday's.
++
++    Self-contained (does not require the Asset subclass) so the variant legs
++    below work on a plain DataFrame too. Falls back to all-False when the
++    loader did not supply `front_expiry`.
++    """
++    if "front_expiry" not in asset.columns:
++        return pd.Series(False, index=asset.index)
++    fe = asset["front_expiry"]
++    return (fe.ne(fe.shift(1)) & fe.shift(1).notna()).fillna(False).astype(bool)
++
++
++def _prev_close_cc(asset: pd.DataFrame) -> pd.Series:
++    """Yesterday's close ON THE CONTRACT HELD TODAY.
++
++    On rollover day t today's front IS yesterday's back, so `close.shift(1)`
++    (the OLD contract) books the calendar spread as P&L: 305 roll days, mean
++    57.0 bps, max 351.8 bps. Same definition as Asset.continuous_prev_close.
++    """
++    prev = asset["close"].astype(float).shift(1)
++    if "back_close" in asset.columns:
++        prev = prev.where(~_is_rollover(asset),
++                          asset["back_close"].astype(float).shift(1))
++    return prev
++
++
++def _prev_open_cc(asset: pd.DataFrame) -> pd.Series:
++    """Yesterday's open on the contract held today (o2o counterpart).
++
++    Exact when the loader supplies `back_open`; otherwise falls back to
++    yesterday's open scaled by the calendar spread measured at yesterday's
++    close. The fallback is a poor substitute - measured against the exact
++    back_open it removes only 32% of the roll error (mean |exact - approx|
++    31.7 bps vs mean |raw - exact| 47.0 bps) - so prefer back_open.
++    """
++    o = asset["open"].astype(float)
++    prev = o.shift(1)
++    roll = _is_rollover(asset)
++    if "back_open" in asset.columns:
++        return prev.where(~roll, asset["back_open"].astype(float).shift(1))
++    if "back_close" in asset.columns:
++        ratio = asset["back_close"].astype(float) / asset["close"].astype(float)
++        return prev.where(~roll, (o * ratio).shift(1))
++    return prev
++
++
++def _next_front_close(asset: pd.DataFrame) -> pd.Series:
++    """Today's 13:45 close on TOMORROW's front contract (noonpause leg).
++
++    `night_open[t+1]` is the 15:00 print of day t but on front(t+1) - the
++    loader merges the night session on (date, front_expiry) - so on the eve of
++    a roll the denominator must be today's BACK close, not today's close.
++    Verified: front_expiry[t+1] == back_expiry[t] on 305/305 roll days.
++    """
++    c = asset["close"].astype(float)
++    if "back_close" not in asset.columns:
++        return c
++    roll_next = _is_rollover(asset).shift(-1).fillna(False).astype(bool)
++    return c.where(~roll_next, asset["back_close"].astype(float))
++
++
+ def _c2c_ret(asset: pd.DataFrame) -> pd.Series:
+-    return asset["close"].astype(float).pct_change()
++    """close[t] / close[t-1] - 1, roll-adjusted (QNT-21).
++
++    Was `close.pct_change()`, which booked the calendar spread on all 305 roll
++    days. B&H c2c 0.493 raw -> 0.700 roll-adjusted.
++    """
++    return asset["close"].astype(float) / _prev_close_cc(asset) - 1
+ 
+ 
+ def _c2c_cost(asset: pd.DataFrame) -> pd.Series:
+@@ -223,9 +290,15 @@
+     real return. It was ~4.2x too volatile for a 75-minute gap and correlated
+     -0.06 with the true gap, which is what produced a uniformly negative
+     Sharpe across every signal.
++
++    Roll-adjusted (QNT-21): night_open[t+1] is already on the NEW front on the
++    eve of a roll, so the denominator is _next_front_close, not close[t]. The
++    unadjusted form booked 47.7 bps mean (370.7 max) on 112 roll-eve days -
++    21% of this 75-minute window's total variance, the worst of the six legs.
++    B&H noonpause -0.253 raw -> +0.611 roll-adjusted.
+     """
+     return (asset["night_open"].astype(float).shift(-1)
+-            / asset["close"].astype(float) - 1)
++            / _next_front_close(asset) - 1)
+ 
+ 
+ def _noonpause_cost(asset: pd.DataFrame) -> pd.Series:
+@@ -234,8 +307,12 @@
+ 
+ 
+ def _o2o_ret(asset: pd.DataFrame) -> pd.Series:
+-    """開盤對開盤 (open-to-open, 08:45 t-1 → 08:45 t)."""
+-    return asset["open"].astype(float).pct_change()
++    """開盤對開盤 (open-to-open, 08:45 t-1 → 08:45 t), roll-adjusted (QNT-21).
++
++    Was `open.pct_change()`: 305 roll days, mean 47.0 bps, max 289.7 bps.
++    B&H o2o 0.483 raw -> 0.666 roll-adjusted (exact back_open).
++    """
++    return asset["open"].astype(float) / _prev_open_cc(asset) - 1
+ 
+ 
+ def _o2o_cost(asset: pd.DataFrame) -> pd.Series:
+--- /home/ubuntu/mtx/cta/simulate.py	2026-08-31 16:24:07.031806110 +0000
++++ proposed/cta/simulate.py	2026-09-01 06:02:26.580070931 +0000
+@@ -349,8 +349,8 @@
+     back_rank  = front_rank + 1
+ 
+     front = raw[raw["_rank"] == front_rank].copy()
+-    back  = raw[raw["_rank"] == back_rank][["date", "expiry_month", "close"]].rename(
+-        columns={"expiry_month": "back_expiry", "close": "back_close"}
++    back  = raw[raw["_rank"] == back_rank][["date", "expiry_month", "open", "close"]].rename(
++        columns={"expiry_month": "back_expiry", "open": "back_open", "close": "back_close"}
+     )
+ 
+     front = front.rename(columns={
+@@ -444,8 +444,9 @@
+ 
+     # ── Back-month (next-rank) close — needed for rollover-adjusted returns ──
+     back_rank = front_rank + 1
+-    back = day[day["_rank"] == back_rank][["date", "expiry", "close"]].rename(columns={
++    back = day[day["_rank"] == back_rank][["date", "expiry", "open", "close"]].rename(columns={
+         "expiry": "back_expiry",
++        "open":   "back_open",
+         "close":  "back_close",
+     })
+     selected = selected.merge(back, on="date", how="left")
+--- /home/ubuntu/mtx/cta/signal_stats.py	2026-09-01 03:12:22.467206289 +0000
++++ proposed/cta/signal_stats.py	2026-09-01 06:02:26.580304811 +0000
+@@ -73,7 +73,7 @@
+     fixed_per_side: float = _FIXED_PER_SIDE,
+     fee_rate:       float = _FEE_RATE,
+     auto_flip:      bool  = True,
+-    roll_adjusted:  bool  = False,
++    roll_adjusted:  bool  = True,     # QNT-21: match the runner / _base.py legs
+ ) -> dict:
+     """Return a rich stats dict for one signal.
+ 

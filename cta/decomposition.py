@@ -19,7 +19,6 @@ from __future__ import annotations
 
 import math
 
-import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 
@@ -71,6 +70,8 @@ def RegimeDecomposition(
         normalized_factors     : {name: normalized factor in (-1, 1)}
         bucket_pnls            : {name: {k: daily PnL Series masked to bucket k}}
     """
+    import matplotlib.pyplot as plt
+
     if factor_norm_window is None:
         factor_norm_window = norm_window
     if decompose_num < 2:

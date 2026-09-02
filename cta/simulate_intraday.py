@@ -13,8 +13,6 @@ daily strategy's.
 
 from __future__ import annotations
 
-import matplotlib.gridspec as gridspec
-import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 
@@ -144,6 +142,9 @@ def SimulateIntraday(
 def _plot_intraday(asset_obj, signal, exec_sig,
                     pnl, cum_pnl, tcost, pnl_net, cum_pnl_net,
                     target_vol: float = 0.15):
+    import matplotlib.pyplot as plt
+    import matplotlib.gridspec as gridspec
+
     fig = plt.figure(figsize=(24, 18))
     gs  = gridspec.GridSpec(3, 3, figure=fig, hspace=0.45, wspace=0.28)
     axes = [[fig.add_subplot(gs[r, c]) for c in range(3)] for r in range(3)]
@@ -367,6 +368,8 @@ def SimulateAllIntraday(
     `exec_lag` controls signal-to-return alignment (see `SimulateIntraday`
     docstring). Set to -1 for the look-ahead oracle test.
     """
+    import matplotlib.pyplot as plt
+
     import math
     if not sigs:
         raise ValueError("Provide at least one signal.")
@@ -510,6 +513,8 @@ def SimulateIntradayCalendar(
 
     All other arguments follow `SimulateIntraday` exactly.
     """
+    import matplotlib.pyplot as plt
+
     asset_obj_full = _load_asset(asset, time_granularity)
     _ops.set_active_asset(asset_obj_full)
 
